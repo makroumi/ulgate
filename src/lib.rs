@@ -23,3 +23,4 @@ pub mod ratelimit;
 pub mod response;
 pub mod router;
 pub mod server;
+pub mod tenant;

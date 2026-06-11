@@ -135,6 +135,12 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
     }
+// Apply capability constraints from request
+    if let Some(caps_arr) = req["capabilities"].as_array() {
+        let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
+        let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
+        runner = runner.with_capabilities(caps);
+    }
 
     let start = std::time::Instant::now();
     match runner.run(flow, flow_input) {
@@ -342,6 +348,12 @@ pub fn handle_run_named(state: &AppState, workflow_name: &str, body: &str) -> St
     let mut runner = FlowRunner::new(registry);
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
+    }
+// Apply capability constraints from request
+    if let Some(caps_arr) = req["capabilities"].as_array() {
+        let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
+        let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
+        runner = runner.with_capabilities(caps);
     }
 
     let start = std::time::Instant::now();
@@ -846,6 +858,12 @@ pub fn handle_run_stream(
     let mut runner = FlowRunner::new(registry);
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
+    }
+// Apply capability constraints from request
+    if let Some(caps_arr) = req["capabilities"].as_array() {
+        let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
+        let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
+        runner = runner.with_capabilities(caps);
     }
 
     let start_time = std::time::Instant::now();

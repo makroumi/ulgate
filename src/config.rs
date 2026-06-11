@@ -36,9 +36,15 @@ impl GatewayConfig {
                 cfg.bind_addr = format!("0.0.0.0:{}", p).parse().unwrap();
             }
         }
-        if let Ok(db) = std::env::var("ULGATE_DB") { cfg.db_path = db; }
-        if let Ok(provider) = std::env::var("LLM_PROVIDER") { cfg.llm_provider = provider; }
-        if let Ok(model) = std::env::var("LLM_MODEL") { cfg.llm_model = model; }
+        if let Ok(db) = std::env::var("ULGATE_DB") {
+            cfg.db_path = db;
+        }
+        if let Ok(provider) = std::env::var("LLM_PROVIDER") {
+            cfg.llm_provider = provider;
+        }
+        if let Ok(model) = std::env::var("LLM_MODEL") {
+            cfg.llm_model = model;
+        }
         if let Ok(key) = std::env::var("LLM_API_KEY")
             .or_else(|_| std::env::var("GROQ_API_KEY"))
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

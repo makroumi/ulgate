@@ -16,8 +16,10 @@
 use std::sync::{Arc, RwLock};
 use uldb::engine::{Engine, EngineConfig};
 use ulflow::llm::LLM;
+use ulgate::auth::ApiKeyStore;
 use ulgate::config::GatewayConfig;
 use ulgate::handlers::AppState;
+use ulgate::ratelimit::HttpRateLimiter;
 use ulgate::server;
 
 fn main() {
@@ -31,20 +33,39 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" | "-p" => { i += 1; port = args.get(i).cloned(); }
-            "--db" | "-d" => { i += 1; db_path = args.get(i).cloned(); }
-            "--llm" | "-l" => { i += 1; llm_spec = args.get(i).cloned(); }
-            "--help" | "-h" => { print_help(); return; }
+            "--port" | "-p" => {
+                i += 1;
+                port = args.get(i).cloned();
+            }
+            "--db" | "-d" => {
+                i += 1;
+                db_path = args.get(i).cloned();
+            }
+            "--llm" | "-l" => {
+                i += 1;
+                llm_spec = args.get(i).cloned();
+            }
+            "--api-key" | "-k" => {
+                i += 1; /* handled below via env */
+            }
+            "--help" | "-h" => {
+                print_help();
+                return;
+            }
             _ => {}
         }
         i += 1;
     }
 
     let mut config = GatewayConfig::from_env();
-    if let Some(p) = port { if let Ok(n) = p.parse::<u16>() {
-        config.bind_addr = format!("0.0.0.0:{}", n).parse().unwrap();
-    }}
-    if let Some(d) = db_path { config.db_path = d; }
+    if let Some(p) = port {
+        if let Ok(n) = p.parse::<u16>() {
+            config.bind_addr = format!("0.0.0.0:{}", n).parse().unwrap();
+        }
+    }
+    if let Some(d) = db_path {
+        config.db_path = d;
+    }
     if let Some(spec) = llm_spec {
         let (p, m) = GatewayConfig::parse_llm_spec(&spec);
         config.llm_provider = p;
@@ -58,8 +79,7 @@ fn main() {
 
     // Open database
     let engine = Arc::new(RwLock::new(
-        Engine::open(EngineConfig::new(&config.db_path))
-            .expect("failed to open database")
+        Engine::open(EngineConfig::new(&config.db_path)).expect("failed to open database"),
     ));
 
     // Build LLM
@@ -72,7 +92,9 @@ fn main() {
     }
 
     // Build app state
-    let registry = Arc::new(ulgate::handlers::build_default_registry(Arc::clone(&engine)));
+    let registry = Arc::new(ulgate::handlers::build_default_registry(Arc::clone(
+        &engine,
+    )));
     let state = Arc::new(AppState {
         engine,
         registry,
@@ -81,9 +103,21 @@ fn main() {
         version: env!("CARGO_PKG_VERSION").into(),
     });
 
+    // Build auth (from ULGATE_API_KEY env var or --api-key)
+    let auth = if let Ok(key) = std::env::var("ULGATE_API_KEY") {
+        println!("Auth:     API key required (Bearer token)");
+        Arc::new(ApiKeyStore::single(&key))
+    } else {
+        println!("Auth:     OPEN (set ULGATE_API_KEY to require auth)");
+        Arc::new(ApiKeyStore::open())
+    };
+
+    // Rate limiter: 100 req/sec per IP, burst of 50
+    let rate_limiter = Arc::new(HttpRateLimiter::new(100, 50));
+    println!("Rate:     100 req/sec per IP");
+
     // Run server
-    server::run(&config.bind_addr.to_string(), state)
-        .expect("server failed");
+    server::run(&config.bind_addr.to_string(), state, auth, rate_limiter).expect("server failed");
 }
 
 fn build_llm(config: &GatewayConfig) -> Option<LLM> {
@@ -115,6 +149,7 @@ fn print_help() {
     println!("  --help, -h         Show this help");
     println!();
     println!("ENVIRONMENT:");
+    println!("  ULGATE_API_KEY     API key for ulgate auth (Bearer token)");
     println!("  GROQ_API_KEY       Groq API key");
     println!("  OPENAI_API_KEY     OpenAI API key");
     println!("  ANTHROPIC_API_KEY  Anthropic API key");

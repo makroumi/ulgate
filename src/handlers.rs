@@ -1,5 +1,6 @@
 //! HTTP request handlers.
 
+use crate::response;
 use std::sync::{Arc, RwLock};
 use uldb::engine::Engine;
 use ulflow::llm::LLM;
@@ -7,7 +8,6 @@ use ulflow::prelude::*;
 use ulflow::step::Input;
 use ulmcp::registry::Registry;
 use ulmcp::tool::*;
-use crate::response;
 
 pub struct AppState {
     pub engine: Arc<RwLock<Engine>>,
@@ -33,19 +33,24 @@ pub fn handle_health(state: &AppState) -> String {
 
 /// GET /v1/tools
 pub fn handle_list_tools(state: &AppState) -> String {
-    let tools: Vec<serde_json::Value> = state.registry.list_tools().iter().map(|t| {
-        serde_json::json!({
-            "name": t.name,
-            "description": t.description,
-            "tags": t.tags,
-            "timeout_ms": t.timeout_ms,
-            "params": t.params.iter().map(|p| serde_json::json!({
-                "name": p.name,
-                "description": p.description,
-                "required": p.required,
-            })).collect::<Vec<_>>(),
+    let tools: Vec<serde_json::Value> = state
+        .registry
+        .list_tools()
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "tags": t.tags,
+                "timeout_ms": t.timeout_ms,
+                "params": t.params.iter().map(|p| serde_json::json!({
+                    "name": p.name,
+                    "description": p.description,
+                    "required": p.required,
+                })).collect::<Vec<_>>(),
+            })
         })
-    }).collect();
+        .collect();
     let body = serde_json::json!({"tools": tools, "count": tools.len()});
     response::ok(&body.to_string())
 }
@@ -106,7 +111,8 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
         }
     }
 
-    let _task = req["input"]["task"].as_str()
+    let _task = req["input"]["task"]
+        .as_str()
         .or_else(|| req["task"].as_str())
         .unwrap_or("analyze")
         .to_string();
@@ -134,12 +140,17 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
     match runner.run(flow, flow_input) {
         Ok(result) => {
             let latency = start.elapsed().as_millis();
-            let outputs: serde_json::Map<String, serde_json::Value> = result.outputs.iter()
+            let outputs: serde_json::Map<String, serde_json::Value> = result
+                .outputs
+                .iter()
                 .filter_map(|(k, v)| {
                     if let ulflow::context::ContextValue::String(s) = v {
                         Some((k.clone(), serde_json::Value::String(s.clone())))
-                    } else { None }
-                }).collect();
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             let body = serde_json::json!({
                 "run_id": result.run_id,
@@ -159,7 +170,9 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
 pub fn handle_search(state: &AppState, query: &str) -> String {
     let mut eng = state.engine.write().unwrap();
     let spec = uldb::query::planner::QuerySpec {
-        text: query.to_string(), top_k: 10, ..Default::default()
+        text: query.to_string(),
+        top_k: 10,
+        ..Default::default()
     };
     let hits = eng.indices.query(&spec);
     let results: Vec<serde_json::Value> = hits.iter().map(|h| {
@@ -257,23 +270,49 @@ pub fn build_default_registry(engine: Arc<RwLock<Engine>>) -> Registry {
     reg.register_tool(
         ToolDef::new("code_search", "Search indexed content by keyword")
             .param("query", "Search query", ParamType::String, true)
-            .param("limit", "Max results (default: 10)", ParamType::Integer, false)
+            .param(
+                "limit",
+                "Max results (default: 10)",
+                ParamType::Integer,
+                false,
+            )
             .tag("search"),
         Box::new(move |call| {
-            let q = call.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = call.arguments.get("limit").and_then(|v| v.as_i64()).unwrap_or(10) as usize;
+            let q = call
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let limit = call
+                .arguments
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10) as usize;
             let mut eng = eng_s.write().unwrap();
             let hits = eng.indices.query(&uldb::query::planner::QuerySpec {
-                text: q.to_string(), top_k: limit, ..Default::default()
+                text: q.to_string(),
+                top_k: limit,
+                ..Default::default()
             });
-            let results: Vec<String> = hits.iter().map(|h| {
-                let k = String::from_utf8_lossy(&h.key).to_string();
-                let v = eng.get(&h.key).map(|d| String::from_utf8_lossy(&d).to_string()).unwrap_or_default();
-                format!("[{}]\n{}", k, &v[..v.len().min(500)])
-            }).collect();
-            ToolResult { call_id: call.call_id.clone(), status: ToolStatus::Success,
+            let results: Vec<String> = hits
+                .iter()
+                .map(|h| {
+                    let k = String::from_utf8_lossy(&h.key).to_string();
+                    let v = eng
+                        .get(&h.key)
+                        .map(|d| String::from_utf8_lossy(&d).to_string())
+                        .unwrap_or_default();
+                    format!("[{}]\n{}", k, &v[..v.len().min(500)])
+                })
+                .collect();
+            ToolResult {
+                call_id: call.call_id.clone(),
+                status: ToolStatus::Success,
                 output: ToolValue::String(results.join("\n\n")),
-                error: None, tokens_used: Some(results.len() * 50), latency_ms: None }
+                error: None,
+                tokens_used: Some(results.len() * 50),
+                latency_ms: None,
+            }
         }),
     );
 
@@ -283,18 +322,33 @@ pub fn build_default_registry(engine: Arc<RwLock<Engine>>) -> Registry {
             .param("key", "Document key", ParamType::String, true)
             .tag("io"),
         Box::new(move |call| {
-            let k = call.arguments.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let k = call
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let eng = eng_r.read().unwrap();
             match eng.get(k.as_bytes()) {
                 Some(d) => {
                     let s = String::from_utf8_lossy(&d).to_string();
                     let len = s.len();
-                    ToolResult { call_id: call.call_id.clone(), status: ToolStatus::Success,
-                        output: ToolValue::String(s), error: None, tokens_used: Some(len/4), latency_ms: None }
+                    ToolResult {
+                        call_id: call.call_id.clone(),
+                        status: ToolStatus::Success,
+                        output: ToolValue::String(s),
+                        error: None,
+                        tokens_used: Some(len / 4),
+                        latency_ms: None,
+                    }
                 }
-                None => ToolResult { call_id: call.call_id.clone(), status: ToolStatus::Error,
-                    output: ToolValue::Null, error: Some(format!("not found: {}", k)),
-                    tokens_used: None, latency_ms: None },
+                None => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Error,
+                    output: ToolValue::Null,
+                    error: Some(format!("not found: {}", k)),
+                    tokens_used: None,
+                    latency_ms: None,
+                },
             }
         }),
     );
@@ -306,15 +360,34 @@ pub fn build_default_registry(engine: Arc<RwLock<Engine>>) -> Registry {
             .param("content", "Content to write", ParamType::String, true)
             .tag("io"),
         Box::new(move |call| {
-            let k = call.arguments.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let c = call.arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let k = call
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let c = call
+                .arguments
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let mut eng = eng_w.write().unwrap();
             match eng.put(k.as_bytes(), c.as_bytes()) {
-                Ok(()) => ToolResult { call_id: call.call_id.clone(), status: ToolStatus::Success,
+                Ok(()) => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Success,
                     output: ToolValue::String(format!("wrote {} bytes to {}", c.len(), k)),
-                    error: None, tokens_used: Some(5), latency_ms: None },
-                Err(e) => ToolResult { call_id: call.call_id.clone(), status: ToolStatus::Error,
-                    output: ToolValue::Null, error: Some(e.to_string()), tokens_used: None, latency_ms: None },
+                    error: None,
+                    tokens_used: Some(5),
+                    latency_ms: None,
+                },
+                Err(e) => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Error,
+                    output: ToolValue::Null,
+                    error: Some(e.to_string()),
+                    tokens_used: None,
+                    latency_ms: None,
+                },
             }
         }),
     );
@@ -332,13 +405,13 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uldb::engine::EngineConfig;
     use tempfile::TempDir;
+    use uldb::engine::EngineConfig;
 
     fn test_state() -> (AppState, TempDir) {
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(RwLock::new(
-            Engine::open(EngineConfig::new(dir.path())).unwrap()
+            Engine::open(EngineConfig::new(dir.path())).unwrap(),
         ));
         let registry = Arc::new(build_default_registry(Arc::clone(&engine)));
         let state = AppState {
@@ -388,7 +461,10 @@ mod tests {
     #[test]
     fn search_returns_results() {
         let (state, _dir) = test_state();
-        handle_put(&state, r#"{"key":"auth/jwt.py","value":"def validate_token jwt auth"}"#);
+        handle_put(
+            &state,
+            r#"{"key":"auth/jwt.py","value":"def validate_token jwt auth"}"#,
+        );
         let resp = handle_search(&state, "validate jwt");
         assert!(resp.contains("auth/jwt.py") || resp.contains("count"));
     }
@@ -396,10 +472,13 @@ mod tests {
     #[test]
     fn tool_call_code_search() {
         let (state, _dir) = test_state();
-        handle_put(&state, r#"{"key":"src/main.rs","value":"fn main() hello world rust"}"#);
+        handle_put(
+            &state,
+            r#"{"key":"src/main.rs","value":"fn main() hello world rust"}"#,
+        );
         let resp = handle_tool_call(
             &state,
-            r#"{"tool":"code_search","arguments":{"query":"main rust"}}"#
+            r#"{"tool":"code_search","arguments":{"query":"main rust"}}"#,
         );
         assert!(resp.contains("200") || resp.contains("output"));
     }

@@ -28,10 +28,26 @@ pub fn method_not_allowed() -> String {
     http_response(405, "application/json", &body)
 }
 
+pub fn http_401(msg: &str) -> String {
+    let body = serde_json::json!({"error": msg, "status": 401}).to_string();
+    http_response(401, "application/json", &body)
+}
+
+pub fn http_429(msg: &str) -> String {
+    let body = serde_json::json!({"error": msg, "status": 429}).to_string();
+    http_response(429, "application/json", &body)
+}
+
 fn http_response(status: u16, content_type: &str, body: &str) -> String {
     let status_text = match status {
-        200 => "OK", 201 => "Created", 400 => "Bad Request",
-        404 => "Not Found", 405 => "Method Not Allowed", 500 => "Internal Server Error",
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        404 => "Not Found",
+        401 => "Unauthorized",
+        405 => "Method Not Allowed",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
         _ => "Unknown",
     };
     format!(

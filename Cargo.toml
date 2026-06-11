@@ -19,6 +19,7 @@ ulmen-core = { path = "../lumen/ulmen-core" }
 ulmcp      = { path = "../ulmcp" }
 ulflow     = { path = "../ulflow" }
 uldb       = { path = "../uldb" }
+ulmp       = { path = "../ulmp" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -16,8 +16,10 @@
 //!
 //! Copyright (c) 2026 El Mehdi Makroumi. All rights reserved.
 
-pub mod router;
-pub mod handlers;
-pub mod server;
+pub mod auth;
 pub mod config;
+pub mod handlers;
+pub mod ratelimit;
 pub mod response;
+pub mod router;
+pub mod server;

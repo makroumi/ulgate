@@ -6,7 +6,7 @@ use crate::response;
 pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
     // Extract query string
     let (path, query) = if let Some(idx) = path.find('?') {
-        (&path[..idx], &path[idx+1..])
+        (&path[..idx], &path[idx + 1..])
     } else {
         (path, "")
     };
@@ -48,7 +48,9 @@ fn extract_param(query: &str, param: &str) -> Option<String> {
         let mut kv = part.splitn(2, '=');
         if kv.next()? == param {
             Some(kv.next().unwrap_or("").to_string())
-        } else { None }
+        } else {
+            None
+        }
     })
 }
 
@@ -59,7 +61,10 @@ mod tests {
     #[test]
     fn extract_query_param() {
         assert_eq!(extract_param("q=hello&limit=10", "q"), Some("hello".into()));
-        assert_eq!(extract_param("q=hello&limit=10", "limit"), Some("10".into()));
+        assert_eq!(
+            extract_param("q=hello&limit=10", "limit"),
+            Some("10".into())
+        );
         assert_eq!(extract_param("q=hello", "missing"), None);
     }
 }

@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 
 use crate::auth::ApiKeyStore;
-use crate::handlers::AppState;
+use crate::handlers::{self, AppState};
 use crate::ratelimit::HttpRateLimiter;
 use crate::response;
 use crate::router;
@@ -124,6 +124,19 @@ fn handle_connection(
     let body_str = String::from_utf8_lossy(&body).to_string();
 
     eprintln!("[ulgate] {} {}", method, path);
+
+    // Handle streaming endpoints directly (write to stream, not buffered response)
+    let clean_path = if let Some(idx) = path.find('?') {
+        &path[..idx]
+    } else {
+        path
+    };
+    if clean_path == "/v1/chat/stream" && method == "POST" {
+        return handlers::handle_chat_stream(state, &body_str, &mut stream);
+    }
+    if clean_path == "/v1/run/stream" && method == "POST" {
+        return handlers::handle_run_stream(state, &body_str, &mut stream);
+    }
 
     let response = router::route(state, method, path, &body_str);
     stream.write_all(response.as_bytes())?;

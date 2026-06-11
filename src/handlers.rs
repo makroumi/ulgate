@@ -262,6 +262,202 @@ pub fn handle_chat(state: &AppState, body: &str) -> String {
     }
 }
 
+/// POST /v1/chat/stream - SSE streaming chat
+pub fn handle_chat_stream(
+    state: &AppState,
+    body: &str,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let llm = match &state.llm {
+        Some(l) => l,
+        None => {
+            let resp = response::bad_request("no LLM configured");
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = response::bad_request(&format!("invalid JSON: {}", e));
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let prompt = match req["message"].as_str().or_else(|| req["prompt"].as_str()) {
+        Some(p) => p,
+        None => {
+            let resp = response::bad_request("missing 'message' field");
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+    let system = req["system"].as_str();
+
+    // SSE headers
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+    stream.flush()?;
+
+    let start_event = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type": "start", "model": llm.model()})
+    );
+    stream.write_all(start_event.as_bytes())?;
+    stream.flush()?;
+
+    let start_time = std::time::Instant::now();
+
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(ulflow::llm::Message {
+            role: ulflow::llm::Role::System,
+            content: sys.to_string(),
+        });
+    }
+    messages.push(ulflow::llm::Message {
+        role: ulflow::llm::Role::User,
+        content: prompt.to_string(),
+    });
+    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), messages);
+
+    // We need to write chunks as they arrive
+    // Use a Vec buffer to collect chunks, then write the final result
+    let mut all_chunks = Vec::<String>::new();
+    let result = llm.chat_stream(&chat_req, |chunk| {
+        all_chunks.push(chunk.to_string());
+    });
+
+    // Write all chunks as SSE events
+    for chunk in &all_chunks {
+        let event = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "token", "content": chunk})
+        );
+        stream.write_all(event.as_bytes())?;
+        stream.flush()?;
+    }
+
+    let latency = start_time.elapsed().as_millis();
+
+    match result {
+        Ok(resp) => {
+            let done = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "type": "done", "model": resp.model,
+                    "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens,
+                    "finish_reason": resp.finish_reason.to_string(), "latency_ms": latency,
+                })
+            );
+            stream.write_all(done.as_bytes())?;
+        }
+        Err(e) => {
+            let err = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"type": "error", "message": e.to_string()})
+            );
+            stream.write_all(err.as_bytes())?;
+        }
+    }
+    stream.flush()?;
+    Ok(())
+}
+
+/// POST /v1/run/stream - SSE streaming workflow
+pub fn handle_run_stream(
+    state: &AppState,
+    body: &str,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = response::bad_request(&format!("invalid JSON: {}", e));
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+    stream.flush()?;
+
+    let mut flow_input = FlowInput::new();
+    if let Some(input_obj) = req["input"].as_object() {
+        for (k, v) in input_obj {
+            if let Some(s) = v.as_str() {
+                flow_input = flow_input.var(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let registry = build_default_registry(Arc::clone(&state.engine));
+    let flow = match Flow::pipeline("gate_run")
+        .context_budget(req["context_budget"].as_u64().unwrap_or(8192) as usize)
+        .step(Step::tool("search").tool("code_search")
+            .input("query", Input::from_var("task")).build())
+        .step(Step::agent("analyze",
+            "You are an expert software engineer.\n\nCode found:\n{{search.output}}\n\nTask: {{task}}\n\nProvide a clear, actionable response.")
+        )
+        .build() {
+        Ok(f) => f,
+        Err(e) => {
+            let err = format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"type":"error","message":e.to_string()}));
+            stream.write_all(err.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let start_event = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type": "start", "workflow": "gate_run"})
+    );
+    stream.write_all(start_event.as_bytes())?;
+    stream.flush()?;
+
+    let mut runner = FlowRunner::new(registry);
+    if let Some(ref llm) = state.llm {
+        runner = runner.with_llm(llm.clone());
+    }
+
+    let start_time = std::time::Instant::now();
+    let result = runner.run(flow, flow_input);
+    let latency = start_time.elapsed().as_millis();
+
+    match result {
+        Ok(r) => {
+            for (key, val) in &r.outputs {
+                if let ulflow::context::ContextValue::String(s) = val {
+                    let event = format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type":"output","key":key,"content":&s[..s.len().min(2000)]})
+                    );
+                    stream.write_all(event.as_bytes())?;
+                    stream.flush()?;
+                }
+            }
+            let done = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "type":"done","status":r.status.to_string(),"steps_completed":r.steps_completed,
+                    "tokens_used":r.tokens_used,"latency_ms":latency
+                })
+            );
+            stream.write_all(done.as_bytes())?;
+        }
+        Err(e) => {
+            let err = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"type":"error","message":e.to_string()})
+            );
+            stream.write_all(err.as_bytes())?;
+        }
+    }
+    stream.flush()?;
+    Ok(())
+}
+
 // Build a registry backed by the engine
 pub fn build_default_registry(engine: Arc<RwLock<Engine>>) -> Registry {
     let mut reg = Registry::new();

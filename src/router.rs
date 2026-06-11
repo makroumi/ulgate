@@ -23,6 +23,11 @@ pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
         ("POST", "/v1/run") => handlers::handle_run(state, body),
         // Chat
         ("POST", "/v1/chat") => handlers::handle_chat(state, body),
+        // Streaming (handled separately in server.rs)
+        ("POST", "/v1/chat/stream") | ("POST", "/v1/run/stream") => {
+            // This should not be called - streaming is handled in server.rs
+            response::bad_request("use streaming endpoint directly")
+        }
         // DB
         ("POST", "/v1/db/put") => handlers::handle_put(state, body),
         ("GET", "/v1/db/get") => {

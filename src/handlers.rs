@@ -159,7 +159,10 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
                 "tokens_used": result.tokens_used,
                 "latency_ms": latency,
                 "outputs": outputs,
+                "workflow": "default",
+                "timestamp": now_ms(),
             });
+            persist_run_result(&state.engine, &body);
             response::ok(&body.to_string())
         }
         Err(e) => response::internal_error(&format!("workflow failed: {}", e)),
@@ -487,6 +490,203 @@ pub fn handle_list_sessions(state: &AppState) -> String {
         })
         .collect();
     response::ok(&serde_json::json!({"sessions": sessions, "count": sessions.len()}).to_string())
+}
+
+fn persist_run_result(engine: &Arc<RwLock<Engine>>, result: &serde_json::Value) {
+    let run_id = result["run_id"].as_str().unwrap_or("unknown");
+    let key = format!("run:{}", run_id);
+    if let Ok(mut eng) = engine.write() {
+        let data = serde_json::to_vec(result).unwrap_or_default();
+        let _ = eng.put(key.as_bytes(), &data);
+    }
+}
+
+// ========================================================================
+// ulview: Observability endpoints
+// ========================================================================
+
+/// GET /v1/runs - list recent workflow runs
+pub fn handle_list_runs(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(b"run:", b"run:\xFF");
+    let runs: Vec<serde_json::Value> = results
+        .iter()
+        .rev()
+        .take(100)
+        .filter_map(|(_k, v)| {
+            let json: serde_json::Value = serde_json::from_slice(v).ok()?;
+            Some(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "steps_completed": json["steps_completed"],
+                "tokens_used": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+                "workflow": json["workflow"],
+                "timestamp": json["timestamp"],
+            }))
+        })
+        .collect();
+    response::ok(&serde_json::json!({"runs": runs, "count": runs.len()}).to_string())
+}
+
+/// GET /v1/runs/:id - get run details
+pub fn handle_get_run(state: &AppState, run_id: &str) -> String {
+    let eng = state.engine.read().unwrap();
+    let key = format!("run:{}", run_id);
+    match eng.get(key.as_bytes()) {
+        Some(d) => {
+            let json: serde_json::Value =
+                serde_json::from_slice(&d).unwrap_or(serde_json::json!({}));
+            response::ok(&json.to_string())
+        }
+        None => response::not_found(&format!("run not found: {}", run_id)),
+    }
+}
+
+/// GET /v1/metrics - aggregated metrics
+pub fn handle_metrics(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(b"run:", b"run:\xFF");
+
+    let total_runs = runs.len();
+    let mut total_tokens = 0u64;
+    let mut total_latency = 0u64;
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    let mut latencies: Vec<u64> = Vec::new();
+
+    for (_, v) in &runs {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            let tokens = json["tokens_used"].as_u64().unwrap_or(0);
+            let latency = json["latency_ms"].as_u64().unwrap_or(0);
+            total_tokens += tokens;
+            total_latency += latency;
+            latencies.push(latency);
+            if json["status"].as_str() == Some("succeeded") {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    }
+
+    latencies.sort();
+    let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
+    let p95 = latencies
+        .get(latencies.len() * 95 / 100)
+        .copied()
+        .unwrap_or(0);
+    let p99 = latencies
+        .get(latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    let avg_latency = if total_runs > 0 {
+        total_latency / total_runs as u64
+    } else {
+        0
+    };
+    let avg_tokens = if total_runs > 0 {
+        total_tokens / total_runs as u64
+    } else {
+        0
+    };
+
+    let uptime = state.start_time.elapsed().as_secs();
+    let runs_per_min = if uptime > 0 {
+        total_runs as f64 / (uptime as f64 / 60.0)
+    } else {
+        0.0
+    };
+    let tokens_per_min = if uptime > 0 {
+        total_tokens as f64 / (uptime as f64 / 60.0)
+    } else {
+        0.0
+    };
+
+    let body = serde_json::json!({
+        "total_runs": total_runs,
+        "succeeded": succeeded,
+        "failed": failed,
+        "success_rate": if total_runs > 0 { format!("{:.1}%", succeeded as f64 / total_runs as f64 * 100.0) } else { "N/A".into() },
+        "total_tokens": total_tokens,
+        "avg_tokens_per_run": avg_tokens,
+        "tokens_per_minute": tokens_per_min as u64,
+        "latency": {
+            "avg_ms": avg_latency,
+            "p50_ms": p50,
+            "p95_ms": p95,
+            "p99_ms": p99,
+        },
+        "runs_per_minute": format!("{:.1}", runs_per_min),
+        "uptime_seconds": uptime,
+        "llm": state.llm.as_ref().map(|l| format!("{}:{}", l.provider(), l.model())),
+        "tools": state.registry.tool_count(),
+    });
+    response::ok(&body.to_string())
+}
+
+/// GET /v1/dashboard - combined health + metrics for dashboards
+pub fn handle_dashboard(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(b"run:", b"run:\xFF");
+    let sessions = eng.scan(b"session:", b"session:\xFF");
+    let workflows = eng.scan(b"workflow:", b"workflow:\xFF");
+
+    let total_runs = runs.len();
+    let mut total_tokens = 0u64;
+    let mut recent_runs: Vec<serde_json::Value> = Vec::new();
+
+    for (_, v) in runs.iter().rev().take(10) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            total_tokens += json["tokens_used"].as_u64().unwrap_or(0);
+            recent_runs.push(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "tokens": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+            }));
+        }
+    }
+
+    let uptime = state.start_time.elapsed().as_secs();
+
+    let body = serde_json::json!({
+        "status": "ok",
+        "version": state.version,
+        "uptime_seconds": uptime,
+        "llm": state.llm.as_ref().map(|l| format!("{}:{}", l.provider(), l.model())),
+        "tools": state.registry.tool_count(),
+        "stats": {
+            "total_runs": total_runs,
+            "total_tokens": total_tokens,
+            "active_sessions": sessions.len(),
+            "registered_workflows": workflows.len(),
+        },
+        "recent_runs": recent_runs,
+    });
+    response::ok(&body.to_string())
+}
+
+/// GET /v1/logs - recent events
+pub fn handle_logs(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(b"run:", b"run:\xFF");
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for (_, v) in runs.iter().rev().take(50) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            events.push(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "workflow": json["workflow"],
+                "tokens": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+                "timestamp": json["timestamp"],
+            }));
+        }
+    }
+
+    response::ok(&serde_json::json!({"events": events, "count": events.len()}).to_string())
 }
 
 /// POST /v1/chat/stream - SSE streaming chat

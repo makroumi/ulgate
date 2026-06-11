@@ -23,6 +23,11 @@ pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
         ("POST", "/v1/run") => handlers::handle_run(state, body),
         // Chat
         ("POST", "/v1/chat") => handlers::handle_chat(state, body),
+        // Observability (ulview)
+        ("GET", "/v1/dashboard") => handlers::handle_dashboard(state),
+        ("GET", "/v1/runs") => handlers::handle_list_runs(state),
+        ("GET", "/v1/metrics") => handlers::handle_metrics(state),
+        ("GET", "/v1/logs") => handlers::handle_logs(state),
         // Workflows
         ("POST", "/v1/workflows") => handlers::handle_register_workflow(state, body),
         ("GET", "/v1/workflows") => handlers::handle_list_workflows(state),

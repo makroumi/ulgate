@@ -138,6 +138,41 @@ fn handle_connection(
         return handlers::handle_run_stream(state, &body_str, &mut stream);
     }
 
+    // Dynamic routes
+    let clean_path2 = if let Some(idx) = path.find('?') {
+        &path[..idx]
+    } else {
+        path
+    };
+    if method == "POST"
+        && clean_path2.starts_with("/v1/sessions/")
+        && clean_path2.ends_with("/message")
+    {
+        let id = &clean_path2["/v1/sessions/".len()..clean_path2.len() - "/message".len()];
+        let resp = handlers::handle_session_message(state, id, &body_str);
+        stream.write_all(resp.as_bytes())?;
+        stream.flush()?;
+        return Ok(());
+    }
+    if method == "GET" && clean_path2.starts_with("/v1/sessions/") {
+        let id = &clean_path2["/v1/sessions/".len()..];
+        if !id.is_empty() {
+            let resp = handlers::handle_get_session(state, id);
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+    if method == "POST" && clean_path2.starts_with("/v1/run/") && clean_path2 != "/v1/run/stream" {
+        let name = &clean_path2["/v1/run/".len()..];
+        if !name.is_empty() {
+            let resp = handlers::handle_run_named(state, name, &body_str);
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+
     let response = router::route(state, method, path, &body_str);
     stream.write_all(response.as_bytes())?;
     stream.flush()?;

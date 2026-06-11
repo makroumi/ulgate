@@ -262,6 +262,233 @@ pub fn handle_chat(state: &AppState, body: &str) -> String {
     }
 }
 
+/// POST /v1/workflows - register a custom workflow from JSON
+pub fn handle_register_workflow(state: &AppState, body: &str) -> String {
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    // Validate the workflow can be built
+    match ulflow::json_flow::flow_from_json(&json) {
+        Ok(flow) => {
+            // Store workflow definition in uldb
+            let key = format!("workflow:{}", flow.name);
+            let mut eng = state.engine.write().unwrap();
+            match eng.put(key.as_bytes(), body.as_bytes()) {
+                Ok(()) => {
+                    let resp = serde_json::json!({
+                        "status": "registered",
+                        "name": flow.name,
+                        "steps": flow.steps.len(),
+                    });
+                    response::ok(&resp.to_string())
+                }
+                Err(e) => response::internal_error(&e.to_string()),
+            }
+        }
+        Err(e) => response::bad_request(&format!("invalid workflow: {}", e)),
+    }
+}
+
+/// GET /v1/workflows - list registered workflows
+pub fn handle_list_workflows(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(b"workflow:", b"workflow:\xFF");
+    let workflows: Vec<serde_json::Value> = results.iter().filter_map(|(k, v)| {
+        let name = String::from_utf8_lossy(k).strip_prefix("workflow:")?.to_string();
+        let json: serde_json::Value = serde_json::from_slice(v).ok()?;
+        Some(serde_json::json!({"name": name, "steps": json["steps"].as_array().map(|a| a.len()).unwrap_or(0)}))
+    }).collect();
+    response::ok(&serde_json::json!({"workflows": workflows, "count": workflows.len()}).to_string())
+}
+
+/// POST /v1/run/:name - run a named workflow
+pub fn handle_run_named(state: &AppState, workflow_name: &str, body: &str) -> String {
+    // Load workflow from uldb
+    let eng = state.engine.read().unwrap();
+    let key = format!("workflow:{}", workflow_name);
+    let workflow_json = match eng.get(key.as_bytes()) {
+        Some(d) => d,
+        None => return response::not_found(&format!("workflow not found: {}", workflow_name)),
+    };
+    drop(eng);
+
+    let json: serde_json::Value = match serde_json::from_slice(&workflow_json) {
+        Ok(v) => v,
+        Err(e) => return response::internal_error(&format!("corrupt workflow: {}", e)),
+    };
+
+    let flow = match ulflow::json_flow::flow_from_json(&json) {
+        Ok(f) => f,
+        Err(e) => return response::internal_error(&format!("build flow: {}", e)),
+    };
+
+    // Parse input
+    let req: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let mut flow_input = FlowInput::new();
+    if let Some(obj) = req["input"].as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                flow_input = flow_input.var(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let registry = build_default_registry(Arc::clone(&state.engine));
+    let mut runner = FlowRunner::new(registry);
+    if let Some(ref llm) = state.llm {
+        runner = runner.with_llm(llm.clone());
+    }
+
+    let start = std::time::Instant::now();
+    match runner.run(flow, flow_input) {
+        Ok(result) => {
+            let outputs: serde_json::Map<String, serde_json::Value> = result
+                .outputs
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let ulflow::context::ContextValue::String(s) = v {
+                        Some((k.clone(), serde_json::Value::String(s.clone())))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            response::ok(
+                &serde_json::json!({
+                    "run_id": result.run_id, "status": result.status.to_string(),
+                    "steps_completed": result.steps_completed, "tokens_used": result.tokens_used,
+                    "latency_ms": start.elapsed().as_millis() as u64, "outputs": outputs,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => response::internal_error(&format!("workflow failed: {}", e)),
+    }
+}
+
+/// POST /v1/sessions/:id/message - add message to session
+pub fn handle_session_message(state: &AppState, session_id: &str, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let message = match req["message"].as_str() {
+        Some(m) => m,
+        None => return response::bad_request("missing 'message' field"),
+    };
+
+    // Load or create session
+    let session_key = format!("session:{}", session_id);
+    let mut history: Vec<serde_json::Value> = {
+        let eng = state.engine.read().unwrap();
+        match eng.get(session_key.as_bytes()) {
+            Some(d) => serde_json::from_slice(&d).unwrap_or_else(|_| Vec::new()),
+            None => Vec::new(),
+        }
+    };
+
+    // Add user message
+    history.push(serde_json::json!({"role": "user", "content": message}));
+
+    // Call LLM with full history
+    let llm = match &state.llm {
+        Some(l) => l,
+        None => return response::bad_request("no LLM configured"),
+    };
+
+    let messages: Vec<ulflow::llm::Message> = history
+        .iter()
+        .filter_map(|m| {
+            let role = match m["role"].as_str()? {
+                "user" => ulflow::llm::Role::User,
+                "assistant" => ulflow::llm::Role::Assistant,
+                "system" => ulflow::llm::Role::System,
+                _ => return None,
+            };
+            Some(ulflow::llm::Message {
+                role,
+                content: m["content"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+
+    let start = std::time::Instant::now();
+    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), messages);
+
+    match llm.chat(&chat_req) {
+        Ok(resp) => {
+            // Add assistant response to history
+            history.push(serde_json::json!({"role": "assistant", "content": resp.content}));
+
+            // Persist to uldb
+            {
+                let mut eng = state.engine.write().unwrap();
+                let _ = eng.put(
+                    session_key.as_bytes(),
+                    serde_json::to_vec(&history).unwrap().as_slice(),
+                );
+            }
+
+            response::ok(
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "content": resp.content,
+                    "model": resp.model,
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "latency_ms": start.elapsed().as_millis() as u64,
+                    "history_length": history.len(),
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => response::internal_error(&e.to_string()),
+    }
+}
+
+/// GET /v1/sessions/:id - get session history
+pub fn handle_get_session(state: &AppState, session_id: &str) -> String {
+    let eng = state.engine.read().unwrap();
+    let key = format!("session:{}", session_id);
+    match eng.get(key.as_bytes()) {
+        Some(d) => {
+            let history: Vec<serde_json::Value> = serde_json::from_slice(&d).unwrap_or_default();
+            response::ok(
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "messages": history,
+                    "length": history.len(),
+                })
+                .to_string(),
+            )
+        }
+        None => response::not_found(&format!("session not found: {}", session_id)),
+    }
+}
+
+/// GET /v1/sessions - list all sessions
+pub fn handle_list_sessions(state: &AppState) -> String {
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(b"session:", b"session:\xFF");
+    let sessions: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(k, v)| {
+            let id = String::from_utf8_lossy(k)
+                .strip_prefix("session:")
+                .unwrap_or("?")
+                .to_string();
+            let count = serde_json::from_slice::<Vec<serde_json::Value>>(v)
+                .map(|h| h.len())
+                .unwrap_or(0);
+            serde_json::json!({"id": id, "messages": count})
+        })
+        .collect();
+    response::ok(&serde_json::json!({"sessions": sessions, "count": sessions.len()}).to_string())
+}
+
 /// POST /v1/chat/stream - SSE streaming chat
 pub fn handle_chat_stream(
     state: &AppState,

@@ -23,6 +23,11 @@ pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
         ("POST", "/v1/run") => handlers::handle_run(state, body),
         // Chat
         ("POST", "/v1/chat") => handlers::handle_chat(state, body),
+        // Workflows
+        ("POST", "/v1/workflows") => handlers::handle_register_workflow(state, body),
+        ("GET", "/v1/workflows") => handlers::handle_list_workflows(state),
+        // Sessions
+        ("GET", "/v1/sessions") => handlers::handle_list_sessions(state),
         // Streaming (handled separately in server.rs)
         ("POST", "/v1/chat/stream") | ("POST", "/v1/run/stream") => {
             // This should not be called - streaming is handled in server.rs

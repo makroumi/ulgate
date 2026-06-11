@@ -42,6 +42,7 @@ __version__ = "0.1.0"
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 class Session:
@@ -160,7 +161,7 @@ class Client:
 
     def search(self, query):
         """GET /v1/db/search"""
-        return self._get(f"/v1/db/search?q={query}")
+        return self._get(f"/v1/db/search?q={urllib.parse.quote(query)}")
 
     # === Observability ===
 

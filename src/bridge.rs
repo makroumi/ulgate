@@ -347,3 +347,56 @@ mod tests {
         assert_eq!(obs_content(&decoded.records[1]), Some("output data"));
     }
 }
+
+/// Parse structured run metadata from an Obs record content string.
+/// Content format: "status=X steps=Y tokens=Z latency=Nms"
+pub fn parse_run_summary(content: &str) -> RunSummary {
+    let mut summary = RunSummary::default();
+    for part in content.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            match k {
+                "status" => summary.status = v.to_string(),
+                "steps" => summary.steps = v.parse().unwrap_or(0),
+                "tokens" => summary.tokens = v.parse().unwrap_or(0),
+                "latency" => {
+                    summary.latency_ms = v.trim_end_matches("ms").parse().unwrap_or(0)
+                }
+                "tenant" => summary.tenant = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    summary
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RunSummary {
+    pub status: String,
+    pub steps: u64,
+    pub tokens: u64,
+    pub latency_ms: u64,
+    pub tenant: Option<String>,
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    #[test]
+    fn parse_run_summary_full() {
+        let s = parse_run_summary("status=succeeded steps=3 tokens=500 latency=120ms tenant=acme");
+        assert_eq!(s.status, "succeeded");
+        assert_eq!(s.steps, 3);
+        assert_eq!(s.tokens, 500);
+        assert_eq!(s.latency_ms, 120);
+        assert_eq!(s.tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn parse_run_summary_partial() {
+        let s = parse_run_summary("status=failed tokens=0");
+        assert_eq!(s.status, "failed");
+        assert_eq!(s.tokens, 0);
+        assert_eq!(s.latency_ms, 0);
+    }
+}

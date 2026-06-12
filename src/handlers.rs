@@ -623,23 +623,28 @@ fn persist_run_result(engine: &Arc<RwLock<Engine>>, result: &serde_json::Value) 
 // ========================================================================
 
 /// GET /v1/runs - list recent workflow runs
+/// Reads ulmen payloads via agent_store.
 pub fn handle_list_runs(state: &AppState) -> String {
     let eng = state.engine.read().unwrap();
-    let results = eng.scan(b"run:", b"run:\xFF");
-    let runs: Vec<serde_json::Value> = results
+    let all_keys = uldb::agent_store::list_sessions(&eng);
+    let runs: Vec<serde_json::Value> = all_keys
         .iter()
+        .filter(|k| k.starts_with("run:"))
         .rev()
         .take(100)
-        .filter_map(|(_k, v)| {
-            let json: serde_json::Value = serde_json::from_slice(v).ok()?;
+        .filter_map(|k| {
+            let payload = uldb::agent_store::load_payload(&eng, k).ok()?;
+            let run_id = k.strip_prefix("run:").unwrap_or(k);
+            let first_obs = payload.records.first()?;
+            let content = bridge::obs_content(first_obs).unwrap_or("");
+            let summary = bridge::parse_run_summary(content);
             Some(serde_json::json!({
-                "run_id": json["run_id"],
-                "status": json["status"],
-                "steps_completed": json["steps_completed"],
-                "tokens_used": json["tokens_used"],
-                "latency_ms": json["latency_ms"],
-                "workflow": json["workflow"],
-                "timestamp": json["timestamp"],
+                "run_id": run_id,
+                "status": summary.status,
+                "steps_completed": summary.steps,
+                "tokens_used": summary.tokens,
+                "latency_ms": summary.latency_ms,
+                "record_count": payload.records.len(),
             }))
         })
         .collect();
@@ -647,66 +652,76 @@ pub fn handle_list_runs(state: &AppState) -> String {
 }
 
 /// GET /v1/runs/:id - get run details
+/// Reads ulmen payload via agent_store, converts to JSON at HTTP boundary.
 pub fn handle_get_run(state: &AppState, run_id: &str) -> String {
+    let store_key = format!("run:{}", run_id);
     let eng = state.engine.read().unwrap();
-    let key = format!("run:{}", run_id);
-    match eng.get(key.as_bytes()) {
-        Some(d) => {
-            let json: serde_json::Value =
-                serde_json::from_slice(&d).unwrap_or(serde_json::json!({}));
-            response::ok(&json.to_string())
+    match uldb::agent_store::load_payload(&eng, &store_key) {
+        Ok(payload) => {
+            let observations = bridge::payload_to_run_json(&payload);
+            let summary = payload
+                .records
+                .first()
+                .and_then(|r| bridge::obs_content(r))
+                .map(|c| bridge::parse_run_summary(c))
+                .unwrap_or_default();
+            response::ok(
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "status": summary.status,
+                    "steps_completed": summary.steps,
+                    "tokens_used": summary.tokens,
+                    "latency_ms": summary.latency_ms,
+                    "records": observations,
+                    "record_count": payload.records.len(),
+                })
+                .to_string(),
+            )
         }
-        None => response::not_found(&format!("run not found: {}", run_id)),
+        Err(_) => response::not_found(&format!("run not found: {}", run_id)),
     }
 }
 
 /// GET /v1/metrics - aggregated metrics
+/// Reads ulmen payloads via agent_store.
 pub fn handle_metrics(state: &AppState) -> String {
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(b"run:", b"run:\xFF");
+    let all_keys = uldb::agent_store::list_sessions(&eng);
 
-    let total_runs = runs.len();
+    let mut total_runs = 0u64;
     let mut total_tokens = 0u64;
     let mut total_latency = 0u64;
     let mut succeeded = 0u64;
     let mut failed = 0u64;
     let mut latencies: Vec<u64> = Vec::new();
 
-    for (_, v) in &runs {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            let tokens = json["tokens_used"].as_u64().unwrap_or(0);
-            let latency = json["latency_ms"].as_u64().unwrap_or(0);
-            total_tokens += tokens;
-            total_latency += latency;
-            latencies.push(latency);
-            if json["status"].as_str() == Some("succeeded") {
-                succeeded += 1;
-            } else {
-                failed += 1;
+    for k in &all_keys {
+        if !k.starts_with("run:") {
+            continue;
+        }
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            total_runs += 1;
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                total_tokens += summary.tokens;
+                total_latency += summary.latency_ms;
+                latencies.push(summary.latency_ms);
+                if summary.status == "succeeded" {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                }
             }
         }
     }
 
     latencies.sort();
     let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
-    let p95 = latencies
-        .get(latencies.len() * 95 / 100)
-        .copied()
-        .unwrap_or(0);
-    let p99 = latencies
-        .get(latencies.len() * 99 / 100)
-        .copied()
-        .unwrap_or(0);
-    let avg_latency = if total_runs > 0 {
-        total_latency / total_runs as u64
-    } else {
-        0
-    };
-    let avg_tokens = if total_runs > 0 {
-        total_tokens / total_runs as u64
-    } else {
-        0
-    };
+    let p95 = latencies.get(latencies.len() * 95 / 100).copied().unwrap_or(0);
+    let p99 = latencies.get(latencies.len() * 99 / 100).copied().unwrap_or(0);
+    let avg_latency = if total_runs > 0 { total_latency / total_runs } else { 0 };
+    let avg_tokens = if total_runs > 0 { total_tokens / total_runs } else { 0 };
 
     let uptime = state.start_time.elapsed().as_secs();
     let runs_per_min = if uptime > 0 {
@@ -743,25 +758,33 @@ pub fn handle_metrics(state: &AppState) -> String {
 }
 
 /// GET /v1/dashboard - combined health + metrics for dashboards
+/// Reads ulmen payloads via agent_store.
 pub fn handle_dashboard(state: &AppState) -> String {
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(b"run:", b"run:\xFF");
-    let sessions = eng.scan(b"session:", b"session:\xFF");
+    let all_keys = uldb::agent_store::list_sessions(&eng);
+
+    let run_keys: Vec<&String> = all_keys.iter().filter(|k| k.starts_with("run:")).collect();
+    let session_keys: Vec<&String> = all_keys.iter().filter(|k| k.starts_with("session:")).collect();
     let workflows = eng.scan(b"workflow:", b"workflow:\xFF");
 
-    let total_runs = runs.len();
+    let total_runs = run_keys.len();
     let mut total_tokens = 0u64;
     let mut recent_runs: Vec<serde_json::Value> = Vec::new();
 
-    for (_, v) in runs.iter().rev().take(10) {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            total_tokens += json["tokens_used"].as_u64().unwrap_or(0);
-            recent_runs.push(serde_json::json!({
-                "run_id": json["run_id"],
-                "status": json["status"],
-                "tokens": json["tokens_used"],
-                "latency_ms": json["latency_ms"],
-            }));
+    for k in run_keys.iter().rev().take(10) {
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                total_tokens += summary.tokens;
+                let run_id = k.strip_prefix("run:").unwrap_or(k);
+                recent_runs.push(serde_json::json!({
+                    "run_id": run_id,
+                    "status": summary.status,
+                    "tokens": summary.tokens,
+                    "latency_ms": summary.latency_ms,
+                }));
+            }
         }
     }
 
@@ -776,7 +799,7 @@ pub fn handle_dashboard(state: &AppState) -> String {
         "stats": {
             "total_runs": total_runs,
             "total_tokens": total_tokens,
-            "active_sessions": sessions.len(),
+            "active_sessions": session_keys.len(),
             "registered_workflows": workflows.len(),
         },
         "recent_runs": recent_runs,
@@ -785,21 +808,27 @@ pub fn handle_dashboard(state: &AppState) -> String {
 }
 
 /// GET /v1/logs - recent events
+/// Reads ulmen payloads via agent_store.
 pub fn handle_logs(state: &AppState) -> String {
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(b"run:", b"run:\xFF");
+    let all_keys = uldb::agent_store::list_sessions(&eng);
 
     let mut events: Vec<serde_json::Value> = Vec::new();
-    for (_, v) in runs.iter().rev().take(50) {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            events.push(serde_json::json!({
-                "run_id": json["run_id"],
-                "status": json["status"],
-                "workflow": json["workflow"],
-                "tokens": json["tokens_used"],
-                "latency_ms": json["latency_ms"],
-                "timestamp": json["timestamp"],
-            }));
+    for k in all_keys.iter().filter(|k| k.starts_with("run:")).rev().take(50) {
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                let run_id = k.strip_prefix("run:").unwrap_or(k);
+                let workflow = bridge::obs_source(first).unwrap_or("unknown");
+                events.push(serde_json::json!({
+                    "run_id": run_id,
+                    "status": summary.status,
+                    "workflow": workflow,
+                    "tokens": summary.tokens,
+                    "latency_ms": summary.latency_ms,
+                }));
+            }
         }
     }
 

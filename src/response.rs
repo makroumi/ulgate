@@ -13,6 +13,11 @@ pub fn bad_request(msg: &str) -> String {
     http_response(400, "application/json", &body)
 }
 
+pub fn forbidden(msg: &str) -> String {
+    let body = serde_json::json!({"error": msg, "status": 403}).to_string();
+    http_response(403, "application/json", &body)
+}
+
 pub fn not_found(msg: &str) -> String {
     let body = serde_json::json!({"error": msg, "status": 404}).to_string();
     http_response(404, "application/json", &body)
@@ -43,15 +48,16 @@ fn http_response(status: u16, content_type: &str, body: &str) -> String {
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
-        404 => "Not Found",
         401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
         405 => "Method Not Allowed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
     };
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n{}",
         status, status_text, content_type, body.len(), body
     )
 }
@@ -79,5 +85,13 @@ mod tests {
     fn cors_headers() {
         let r = ok("{}");
         assert!(r.contains("Access-Control-Allow-Origin: *"));
+        assert!(r.contains("DELETE"));
+    }
+
+    #[test]
+    fn forbidden_response() {
+        let r = forbidden("nope");
+        assert!(r.contains("403"));
+        assert!(r.contains("nope"));
     }
 }

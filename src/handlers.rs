@@ -1,6 +1,7 @@
 //! HTTP request handlers.
 
 use crate::response;
+use crate::tenant::{self, Tenant, TenantRegistry};
 use std::sync::{Arc, RwLock};
 use uldb::engine::Engine;
 use ulflow::llm::LLM;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub llm: Option<LLM>,
     pub start_time: std::time::Instant,
     pub version: String,
+    pub tenants: Arc<RwLock<TenantRegistry>>,
 }
 
 /// GET /v1/health
@@ -209,6 +211,8 @@ pub fn handle_put(state: &AppState, body: &str) -> String {
         Some(v) => v,
         None => return response::bad_request("missing 'value'"),
     };
+    // Note: db:write capability is enforced at the tenant level.
+    // Per-request capability checks happen in /v1/run via capabilities field.
     let mut eng = state.engine.write().unwrap();
     match eng.put(key.as_bytes(), value.as_bytes()) {
         Ok(()) => response::ok(&serde_json::json!({"status":"ok","key":key}).to_string()),
@@ -1061,6 +1065,7 @@ mod tests {
             llm: None,
             start_time: std::time::Instant::now(),
             version: "0.1.0".into(),
+            tenants: Arc::new(RwLock::new(TenantRegistry::new())),
         };
         (state, dir)
     }
@@ -1137,4 +1142,1394 @@ mod tests {
         let resp = handle_chat(&state, r#"{"message":"hello"}"#);
         assert!(resp.contains("400") || resp.contains("no LLM"));
     }
+}
+
+// ========================================================================
+// Multi-tenant helpers and tenant-aware handlers
+// ========================================================================
+
+fn tenant_caps(tenant: &Tenant) -> ulflow::capability::Capabilities {
+    let refs: Vec<&str> = tenant.capabilities.iter().map(|s| s.as_str()).collect();
+    ulflow::capability::Capabilities::from_strings(format!("tenant:{}", tenant.id), &refs)
+}
+
+fn tenant_tool_allowlist(tenant: &Tenant) -> Vec<String> {
+    if tenant.capabilities.iter().any(|c| c == "tool:*") {
+        return vec!["*".into()];
+    }
+    tenant
+        .capabilities
+        .iter()
+        .filter_map(|c| c.strip_prefix("tool:").map(|s| s.to_string()))
+        .collect()
+}
+
+fn prefix_end_bytes(prefix: &str) -> Vec<u8> {
+    let mut end = prefix.as_bytes().to_vec();
+    end.push(0xFF);
+    end
+}
+
+fn record_tenant_usage(state: &AppState, tenant: &Tenant, tokens: u64) {
+
+
+    if let Ok(reg) = state.tenants.read() {
+        reg.record_usage(&tenant.id, tokens);
+    }
+}
+
+fn persist_run_result_for_tenant(
+    engine: &Arc<RwLock<Engine>>,
+    tenant: &Tenant,
+    result: &serde_json::Value,
+) {
+    let run_id = result["run_id"].as_str().unwrap_or("unknown");
+    let key = tenant.run_key(run_id);
+    if let Ok(mut eng) = engine.write() {
+        let data = serde_json::to_vec(result).unwrap_or_default();
+        let _ = eng.put(key.as_bytes(), &data);
+    }
+}
+
+pub fn build_tenant_registry(engine: Arc<RwLock<Engine>>, tenant: &Tenant) -> Registry {
+    let mut reg = Registry::new();
+
+    let tenant_id_search = tenant.id.clone();
+    let doc_prefix_search = format!("t:{}:doc:", tenant.id);
+    let eng_s = Arc::clone(&engine);
+    reg.register_tool(
+        ToolDef::new("code_search", "Search indexed content by keyword")
+            .param("query", "Search query", ParamType::String, true)
+            .param("limit", "Max results (default: 10)", ParamType::Integer, false)
+            .tag("search"),
+        Box::new(move |call| {
+            let q = call
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let limit = call
+                .arguments
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10) as usize;
+
+            let mut eng = eng_s.write().unwrap();
+            let hits = eng.indices.query(&uldb::query::planner::QuerySpec {
+                text: q.to_string(),
+                top_k: limit * 4,
+                ..Default::default()
+            });
+
+            let results: Vec<String> = hits
+                .iter()
+                .filter_map(|h| {
+                    let k = String::from_utf8_lossy(&h.key).to_string();
+                    if !k.starts_with(&doc_prefix_search) {
+                        return None;
+                    }
+                    let v = eng
+                        .get(&h.key)
+                        .map(|d| String::from_utf8_lossy(&d).to_string())
+                        .unwrap_or_default();
+                    let display = k
+                        .strip_prefix(&format!("t:{}:doc:", tenant_id_search))
+                        .unwrap_or(&k);
+                    Some(format!("[{}]\n{}", display, &v[..v.len().min(500)]))
+                })
+                .take(limit)
+                .collect();
+
+            ToolResult {
+                call_id: call.call_id.clone(),
+                status: ToolStatus::Success,
+                output: ToolValue::String(results.join("\n\n")),
+                error: None,
+                tokens_used: Some(results.len() * 50),
+                latency_ms: None,
+            }
+        }),
+    );
+
+    let tenant_id_read = tenant.id.clone();
+    let eng_r = Arc::clone(&engine);
+    reg.register_tool(
+        ToolDef::new("file_read", "Read a document by key")
+            .param("key", "Document key", ParamType::String, true)
+            .tag("io"),
+        Box::new(move |call| {
+            let k = call
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let scoped = format!("t:{}:doc:{}", tenant_id_read, k);
+            let eng = eng_r.read().unwrap();
+            match eng.get(scoped.as_bytes()) {
+                Some(d) => {
+                    let s = String::from_utf8_lossy(&d).to_string();
+                    let len = s.len();
+                    ToolResult {
+                        call_id: call.call_id.clone(),
+                        status: ToolStatus::Success,
+                        output: ToolValue::String(s),
+                        error: None,
+                        tokens_used: Some(len / 4),
+                        latency_ms: None,
+                    }
+                }
+                None => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Error,
+                    output: ToolValue::Null,
+                    error: Some(format!("not found: {}", k)),
+                    tokens_used: None,
+                    latency_ms: None,
+                },
+            }
+        }),
+    );
+
+    let tenant_id_write = tenant.id.clone();
+    let eng_w = Arc::clone(&engine);
+    reg.register_tool(
+        ToolDef::new("file_write", "Write a document")
+            .param("key", "Document key", ParamType::String, true)
+            .param("content", "Content to write", ParamType::String, true)
+            .tag("io"),
+        Box::new(move |call| {
+            let k = call
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let c = call
+                .arguments
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let scoped = format!("t:{}:doc:{}", tenant_id_write, k);
+            let mut eng = eng_w.write().unwrap();
+            match eng.put(scoped.as_bytes(), c.as_bytes()) {
+                Ok(()) => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Success,
+                    output: ToolValue::String(format!("wrote {} bytes to {}", c.len(), k)),
+                    error: None,
+                    tokens_used: Some(5),
+                    latency_ms: None,
+                },
+                Err(e) => ToolResult {
+                    call_id: call.call_id.clone(),
+                    status: ToolStatus::Error,
+                    output: ToolValue::Null,
+                    error: Some(e.to_string()),
+                    tokens_used: None,
+                    latency_ms: None,
+                },
+            }
+        }),
+    );
+
+    reg
+}
+
+pub fn handle_tool_call_for_tenant(state: &AppState, tenant: &Tenant, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let tool_name = match req["tool"].as_str() {
+        Some(t) => t,
+        None => return response::bad_request("missing 'tool' field"),
+    };
+
+    let mut arguments = std::collections::HashMap::new();
+    if let Some(args) = req["arguments"].as_object() {
+        for (k, v) in args {
+            arguments.insert(k.clone(), ulmcp::mcp::adapter::json_to_tool_value(v));
+        }
+    }
+
+    let call = ulmcp::tool::ToolCall {
+        call_id: format!("gate_{}", now_ms()),
+        tool_name: tool_name.to_string(),
+        arguments,
+    };
+
+    let allowed_owned = tenant_tool_allowlist(tenant);
+    let allowed_refs: Vec<&str> = allowed_owned.iter().map(|s| s.as_str()).collect();
+
+    let result = state.registry.invoke_checked(&call, Some(&allowed_refs));
+    if result.status == ToolStatus::Error
+        && result
+            .error
+            .as_deref()
+            .map(|e| e.contains("capability denied"))
+            .unwrap_or(false)
+    {
+        return response::forbidden(result.error.as_deref().unwrap_or("capability denied"));
+    }
+
+    record_tenant_usage(state, tenant, result.tokens_used.unwrap_or(0) as u64);
+
+    let output = ulmcp::mcp::adapter::tool_value_to_json(&result.output);
+    let body = serde_json::json!({
+        "call_id": result.call_id,
+        "status": result.status.to_string(),
+        "output": output,
+        "error": result.error,
+        "tokens_used": result.tokens_used,
+        "latency_ms": result.latency_ms,
+        "tenant_id": tenant.id,
+    });
+    response::ok(&body.to_string())
+}
+
+pub fn handle_search_for_tenant(state: &AppState, tenant: &Tenant, query: &str) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_db_search() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let prefix = format!("t:{}:doc:", tenant.id);
+    let mut eng = state.engine.write().unwrap();
+    let spec = uldb::query::planner::QuerySpec {
+        text: query.to_string(),
+        top_k: 25,
+        ..Default::default()
+    };
+    let hits = eng.indices.query(&spec);
+    let results: Vec<serde_json::Value> = hits
+        .iter()
+        .filter_map(|h| {
+            let key = String::from_utf8_lossy(&h.key).to_string();
+            if !key.starts_with(&prefix) {
+                return None;
+            }
+            let value = eng
+                .get(&h.key)
+                .map(|v| String::from_utf8_lossy(&v).to_string())
+                .unwrap_or_default();
+            let display_key = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+            Some(serde_json::json!({
+                "key": display_key,
+                "score": h.score,
+                "content": &value[..value.len().min(200)]
+            }))
+        })
+        .take(10)
+        .collect();
+
+    record_tenant_usage(state, tenant, 0);
+
+    let body = serde_json::json!({
+        "tenant_id": tenant.id,
+        "query": query,
+        "results": results,
+        "count": results.len()
+    });
+    response::ok(&body.to_string())
+}
+
+pub fn handle_put_for_tenant(state: &AppState, tenant: &Tenant, body: &str) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_db_write() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+    let key = match req["key"].as_str() {
+        Some(k) => k,
+        None => return response::bad_request("missing 'key'"),
+    };
+    let value = match req["value"].as_str() {
+        Some(v) => v,
+        None => return response::bad_request("missing 'value'"),
+    };
+
+    let scoped = tenant.doc_key(key);
+    let mut eng = state.engine.write().unwrap();
+    match eng.put(scoped.as_bytes(), value.as_bytes()) {
+        Ok(()) => {
+            record_tenant_usage(state, tenant, 0);
+            response::ok(
+                &serde_json::json!({"status":"ok","key":key,"tenant_id":tenant.id}).to_string(),
+            )
+        }
+        Err(e) => response::internal_error(&e.to_string()),
+    }
+}
+
+pub fn handle_get_for_tenant(state: &AppState, tenant: &Tenant, key: &str) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_db_read() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let eng = state.engine.read().unwrap();
+    let scoped = tenant.doc_key(key);
+    match eng.get(scoped.as_bytes()) {
+        Some(v) => {
+            record_tenant_usage(state, tenant, 0);
+            let val = String::from_utf8_lossy(&v).to_string();
+            let body = serde_json::json!({
+                "key": key,
+                "value": val,
+                "size": v.len(),
+                "tenant_id": tenant.id
+            });
+            response::ok(&body.to_string())
+        }
+        None => response::not_found(&format!("key not found: {}", key)),
+    }
+}
+
+pub fn handle_chat_for_tenant(state: &AppState, tenant: &Tenant, body: &str) -> String {
+    let llm = match &state.llm {
+        Some(l) => l,
+        None => return response::bad_request("no LLM configured. Set LLM_PROVIDER and API key."),
+    };
+
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_llm(llm.provider()) {
+        return response::forbidden(&e.to_string());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let prompt = match req["message"].as_str().or_else(|| req["prompt"].as_str()) {
+        Some(p) => p,
+        None => return response::bad_request("missing 'message' or 'prompt' field"),
+    };
+    let system = req["system"].as_str();
+
+    let start = std::time::Instant::now();
+    let result = if let Some(sys) = system {
+        llm.ask_with_system(sys, prompt)
+    } else {
+        llm.ask(prompt)
+    };
+    let latency = start.elapsed().as_millis();
+
+    match result {
+        Ok(resp) => {
+            record_tenant_usage(
+                state,
+                tenant,
+                (resp.input_tokens + resp.output_tokens) as u64,
+            );
+            let body = serde_json::json!({
+                "tenant_id": tenant.id,
+                "content": resp.content,
+                "model": resp.model,
+                "input_tokens": resp.input_tokens,
+                "output_tokens": resp.output_tokens,
+                "finish_reason": resp.finish_reason.to_string(),
+                "latency_ms": latency,
+            });
+            response::ok(&body.to_string())
+        }
+        Err(e) => response::internal_error(&e.to_string()),
+    }
+}
+
+pub fn handle_register_workflow_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    body: &str,
+) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_workflow_register() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    match ulflow::json_flow::flow_from_json(&json) {
+        Ok(flow) => {
+            let key = tenant.workflow_key(&flow.name);
+            let mut eng = state.engine.write().unwrap();
+            match eng.put(key.as_bytes(), body.as_bytes()) {
+                Ok(()) => {
+                    record_tenant_usage(state, tenant, 0);
+                    let resp = serde_json::json!({
+                        "status": "registered",
+                        "name": flow.name,
+                        "steps": flow.steps.len(),
+                        "tenant_id": tenant.id,
+                    });
+                    response::ok(&resp.to_string())
+                }
+                Err(e) => response::internal_error(&e.to_string()),
+            }
+        }
+        Err(e) => response::bad_request(&format!("invalid workflow: {}", e)),
+    }
+}
+
+pub fn handle_list_workflows_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let prefix = format!("t:{}:workflow:", tenant.id);
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+    let workflows: Vec<serde_json::Value> = results
+        .iter()
+        .filter_map(|(k, v)| {
+            let raw = String::from_utf8_lossy(k).to_string();
+            let name = raw.strip_prefix(&prefix)?.to_string();
+            let json: serde_json::Value = serde_json::from_slice(v).ok()?;
+            Some(serde_json::json!({
+                "name": name,
+                "steps": json["steps"].as_array().map(|a| a.len()).unwrap_or(0)
+            }))
+        })
+        .collect();
+
+    record_tenant_usage(state, tenant, 0);
+    response::ok(
+        &serde_json::json!({
+            "tenant_id": tenant.id,
+            "workflows": workflows,
+            "count": workflows.len()
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_run_for_tenant(state: &AppState, tenant: &Tenant, body: &str) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_workflow_execute() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let mut flow_input = FlowInput::new();
+    if let Some(input_obj) = req["input"].as_object() {
+        for (k, v) in input_obj {
+            if let Some(s) = v.as_str() {
+                flow_input = flow_input.var(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let registry = build_tenant_registry(Arc::clone(&state.engine), tenant);
+    let flow = match Flow::pipeline("gate_run")
+        .context_budget(req["context_budget"].as_u64().unwrap_or(8192) as usize)
+        .step(
+            Step::tool("search")
+                .tool("code_search")
+                .input("query", Input::from_var("task"))
+                .build(),
+        )
+        .step(Step::agent(
+            "analyze",
+            "You are an expert software engineer.\n\nCode found:\n{{search.output}}\n\nTask: {{task}}\n\nProvide a clear, actionable response.",
+        ))
+        .build()
+    {
+        Ok(f) => f,
+        Err(e) => return response::internal_error(&format!("flow build failed: {}", e)),
+    };
+
+    let mut runner = FlowRunner::new(registry)
+        .with_capabilities(caps)
+        .with_recording();
+
+    if let Some(ref llm) = state.llm {
+        runner = runner.with_llm(llm.clone());
+    }
+
+    let start = std::time::Instant::now();
+    match runner.run(flow, flow_input) {
+        Ok(result) => {
+            let latency = start.elapsed().as_millis();
+            let outputs: serde_json::Map<String, serde_json::Value> = result
+                .outputs
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let ulflow::context::ContextValue::String(s) = v {
+                        Some((k.clone(), serde_json::Value::String(s.clone())))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let recording = runner
+                .take_recording()
+                .and_then(|r| serde_json::to_value(r).ok());
+
+            let mut body = serde_json::json!({
+                "tenant_id": tenant.id,
+                "run_id": result.run_id,
+                "status": result.status.to_string(),
+                "steps_completed": result.steps_completed,
+                "tokens_used": result.tokens_used,
+                "latency_ms": latency,
+                "outputs": outputs,
+                "workflow": "default",
+                "timestamp": now_ms(),
+            });
+
+            if let Some(recording) = recording {
+                body["recording"] = recording;
+            }
+
+            persist_run_result_for_tenant(&state.engine, tenant, &body);
+            record_tenant_usage(state, tenant, result.tokens_used as u64);
+            response::ok(&body.to_string())
+        }
+        Err(e) => response::internal_error(&format!("workflow failed: {}", e)),
+    }
+}
+
+pub fn handle_run_named_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    workflow_name: &str,
+    body: &str,
+) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_workflow_execute() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let scoped_key = tenant.workflow_key(workflow_name);
+    let eng = state.engine.read().unwrap();
+    let workflow_json = match eng.get(scoped_key.as_bytes()) {
+        Some(d) => d,
+        None => return response::not_found(&format!("workflow not found: {}", workflow_name)),
+    };
+    drop(eng);
+
+    let json: serde_json::Value = match serde_json::from_slice(&workflow_json) {
+        Ok(v) => v,
+        Err(e) => return response::internal_error(&format!("corrupt workflow: {}", e)),
+    };
+
+    let flow = match ulflow::json_flow::flow_from_json(&json) {
+        Ok(f) => f,
+        Err(e) => return response::internal_error(&format!("build flow: {}", e)),
+    };
+
+    let req: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let mut flow_input = FlowInput::new();
+    if let Some(obj) = req["input"].as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                flow_input = flow_input.var(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let registry = build_tenant_registry(Arc::clone(&state.engine), tenant);
+    let mut runner = FlowRunner::new(registry)
+        .with_capabilities(caps)
+        .with_recording();
+    if let Some(ref llm) = state.llm {
+        runner = runner.with_llm(llm.clone());
+    }
+
+    let start = std::time::Instant::now();
+    match runner.run(flow, flow_input) {
+        Ok(result) => {
+            let outputs: serde_json::Map<String, serde_json::Value> = result
+                .outputs
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let ulflow::context::ContextValue::String(s) = v {
+                        Some((k.clone(), serde_json::Value::String(s.clone())))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let recording = runner
+                .take_recording()
+                .and_then(|r| serde_json::to_value(r).ok());
+
+            let mut body = serde_json::json!({
+                "tenant_id": tenant.id,
+                "run_id": result.run_id,
+                "status": result.status.to_string(),
+                "steps_completed": result.steps_completed,
+                "tokens_used": result.tokens_used,
+                "latency_ms": start.elapsed().as_millis() as u64,
+                "outputs": outputs,
+                "workflow": workflow_name,
+                "timestamp": now_ms(),
+            });
+
+            if let Some(recording) = recording {
+                body["recording"] = recording;
+            }
+
+            persist_run_result_for_tenant(&state.engine, tenant, &body);
+            record_tenant_usage(state, tenant, result.tokens_used as u64);
+            response::ok(&body.to_string())
+        }
+        Err(e) => response::internal_error(&format!("workflow failed: {}", e)),
+    }
+}
+
+pub fn handle_session_message_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    session_id: &str,
+    body: &str,
+) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_session_create() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let message = match req["message"].as_str() {
+        Some(m) => m,
+        None => return response::bad_request("missing 'message' field"),
+    };
+
+    let session_key = tenant.session_key(session_id);
+    let mut history: Vec<serde_json::Value> = {
+        let eng = state.engine.read().unwrap();
+        match eng.get(session_key.as_bytes()) {
+            Some(d) => serde_json::from_slice(&d).unwrap_or_else(|_| Vec::new()),
+            None => Vec::new(),
+        }
+    };
+
+    history.push(serde_json::json!({"role": "user", "content": message}));
+
+    let llm = match &state.llm {
+        Some(l) => l,
+        None => return response::bad_request("no LLM configured"),
+    };
+
+    if let Err(e) = caps.require_llm(llm.provider()) {
+        return response::forbidden(&e.to_string());
+    }
+
+    let messages: Vec<ulflow::llm::Message> = history
+        .iter()
+        .filter_map(|m| {
+            let role = match m["role"].as_str()? {
+                "user" => ulflow::llm::Role::User,
+                "assistant" => ulflow::llm::Role::Assistant,
+                "system" => ulflow::llm::Role::System,
+                _ => return None,
+            };
+            Some(ulflow::llm::Message {
+                role,
+                content: m["content"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+
+    let start = std::time::Instant::now();
+    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), messages);
+
+    match llm.chat(&chat_req) {
+        Ok(resp) => {
+            history.push(serde_json::json!({"role": "assistant", "content": resp.content}));
+
+            {
+                let mut eng = state.engine.write().unwrap();
+                let _ = eng.put(
+                    session_key.as_bytes(),
+                    serde_json::to_vec(&history).unwrap().as_slice(),
+                );
+            }
+
+            record_tenant_usage(
+                state,
+                tenant,
+                (resp.input_tokens + resp.output_tokens) as u64,
+            );
+
+            response::ok(
+                &serde_json::json!({
+                    "tenant_id": tenant.id,
+                    "session_id": session_id,
+                    "content": resp.content,
+                    "model": resp.model,
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "latency_ms": start.elapsed().as_millis() as u64,
+                    "history_length": history.len(),
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => response::internal_error(&e.to_string()),
+    }
+}
+
+pub fn handle_get_session_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    session_id: &str,
+) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_session_read() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let eng = state.engine.read().unwrap();
+    let key = tenant.session_key(session_id);
+    match eng.get(key.as_bytes()) {
+        Some(d) => {
+            record_tenant_usage(state, tenant, 0);
+            let history: Vec<serde_json::Value> = serde_json::from_slice(&d).unwrap_or_default();
+            response::ok(
+                &serde_json::json!({
+                    "tenant_id": tenant.id,
+                    "session_id": session_id,
+                    "messages": history,
+                    "length": history.len(),
+                })
+                .to_string(),
+            )
+        }
+        None => response::not_found(&format!("session not found: {}", session_id)),
+    }
+}
+
+pub fn handle_list_sessions_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_session_read() {
+        return response::forbidden(&e.to_string());
+    }
+
+    let prefix = format!("t:{}:session:", tenant.id);
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+    let sessions: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(k, v)| {
+            let raw = String::from_utf8_lossy(k).to_string();
+            let id = raw.strip_prefix(&prefix).unwrap_or("?").to_string();
+            let count = serde_json::from_slice::<Vec<serde_json::Value>>(v)
+                .map(|h| h.len())
+                .unwrap_or(0);
+            serde_json::json!({"id": id, "messages": count})
+        })
+        .collect();
+
+    record_tenant_usage(state, tenant, 0);
+    response::ok(
+        &serde_json::json!({
+            "tenant_id": tenant.id,
+            "sessions": sessions,
+            "count": sessions.len()
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_list_runs_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let prefix = format!("t:{}:run:", tenant.id);
+    let eng = state.engine.read().unwrap();
+    let results = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+    let runs: Vec<serde_json::Value> = results
+        .iter()
+        .rev()
+        .take(100)
+        .filter_map(|(_k, v)| {
+            let json: serde_json::Value = serde_json::from_slice(v).ok()?;
+            Some(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "steps_completed": json["steps_completed"],
+                "tokens_used": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+                "workflow": json["workflow"],
+                "timestamp": json["timestamp"],
+            }))
+        })
+        .collect();
+
+    record_tenant_usage(state, tenant, 0);
+    response::ok(
+        &serde_json::json!({
+            "tenant_id": tenant.id,
+            "runs": runs,
+            "count": runs.len()
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_get_run_for_tenant(state: &AppState, tenant: &Tenant, run_id: &str) -> String {
+    let eng = state.engine.read().unwrap();
+    let key = tenant.run_key(run_id);
+    match eng.get(key.as_bytes()) {
+        Some(d) => {
+            record_tenant_usage(state, tenant, 0);
+            let json: serde_json::Value =
+                serde_json::from_slice(&d).unwrap_or(serde_json::json!({}));
+            response::ok(&json.to_string())
+        }
+        None => response::not_found(&format!("run not found: {}", run_id)),
+    }
+}
+
+pub fn handle_metrics_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let prefix = format!("t:{}:run:", tenant.id);
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+
+    let total_runs = runs.len();
+    let mut total_tokens = 0u64;
+    let mut total_latency = 0u64;
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    let mut latencies: Vec<u64> = Vec::new();
+
+    for (_, v) in &runs {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            let tokens = json["tokens_used"].as_u64().unwrap_or(0);
+            let latency = json["latency_ms"].as_u64().unwrap_or(0);
+            total_tokens += tokens;
+            total_latency += latency;
+            latencies.push(latency);
+            if json["status"].as_str() == Some("succeeded") {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    }
+
+    latencies.sort();
+    let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
+    let p95 = latencies.get(latencies.len() * 95 / 100).copied().unwrap_or(0);
+    let p99 = latencies.get(latencies.len() * 99 / 100).copied().unwrap_or(0);
+    let avg_latency = if total_runs > 0 {
+        total_latency / total_runs as u64
+    } else {
+        0
+    };
+    let avg_tokens = if total_runs > 0 {
+        total_tokens / total_runs as u64
+    } else {
+        0
+    };
+
+    record_tenant_usage(state, tenant, 0);
+
+    let body = serde_json::json!({
+        "tenant_id": tenant.id,
+        "total_runs": total_runs,
+        "succeeded": succeeded,
+        "failed": failed,
+        "success_rate": if total_runs > 0 { format!("{:.1}%", succeeded as f64 / total_runs as f64 * 100.0) } else { "N/A".into() },
+        "total_tokens": total_tokens,
+        "avg_tokens_per_run": avg_tokens,
+        "latency": {
+            "avg_ms": avg_latency,
+            "p50_ms": p50,
+            "p95_ms": p95,
+            "p99_ms": p99,
+        },
+    });
+    response::ok(&body.to_string())
+}
+
+pub fn handle_dashboard_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let runs_prefix = format!("t:{}:run:", tenant.id);
+    let sessions_prefix = format!("t:{}:session:", tenant.id);
+    let workflows_prefix = format!("t:{}:workflow:", tenant.id);
+
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(runs_prefix.as_bytes(), &prefix_end_bytes(&runs_prefix));
+    let sessions = eng.scan(
+        sessions_prefix.as_bytes(),
+        &prefix_end_bytes(&sessions_prefix),
+    );
+    let workflows = eng.scan(
+        workflows_prefix.as_bytes(),
+        &prefix_end_bytes(&workflows_prefix),
+    );
+
+    let total_runs = runs.len();
+    let mut total_tokens = 0u64;
+    let mut recent_runs: Vec<serde_json::Value> = Vec::new();
+
+    for (_, v) in runs.iter().rev().take(10) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            total_tokens += json["tokens_used"].as_u64().unwrap_or(0);
+            recent_runs.push(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "tokens": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+            }));
+        }
+    }
+
+    record_tenant_usage(state, tenant, 0);
+
+    let body = serde_json::json!({
+        "status": "ok",
+        "tenant_id": tenant.id,
+        "version": state.version,
+        "llm": state.llm.as_ref().map(|l| format!("{}:{}", l.provider(), l.model())),
+        "tools": state.registry.tool_count(),
+        "stats": {
+            "total_runs": total_runs,
+            "total_tokens": total_tokens,
+            "active_sessions": sessions.len(),
+            "registered_workflows": workflows.len(),
+        },
+        "recent_runs": recent_runs,
+    });
+    response::ok(&body.to_string())
+}
+
+pub fn handle_logs_for_tenant(state: &AppState, tenant: &Tenant) -> String {
+    let prefix = format!("t:{}:run:", tenant.id);
+    let eng = state.engine.read().unwrap();
+    let runs = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for (_, v) in runs.iter().rev().take(50) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+            events.push(serde_json::json!({
+                "run_id": json["run_id"],
+                "status": json["status"],
+                "workflow": json["workflow"],
+                "tokens": json["tokens_used"],
+                "latency_ms": json["latency_ms"],
+                "timestamp": json["timestamp"],
+            }));
+        }
+    }
+
+    record_tenant_usage(state, tenant, 0);
+    response::ok(
+        &serde_json::json!({"tenant_id": tenant.id, "events": events, "count": events.len()})
+            .to_string(),
+    )
+}
+
+pub fn handle_chat_stream_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    body: &str,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let llm = match &state.llm {
+        Some(l) => l,
+        None => {
+            let resp = response::bad_request("no LLM configured");
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_llm(llm.provider()) {
+        let resp = response::forbidden(&e.to_string());
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = response::bad_request(&format!("invalid JSON: {}", e));
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let prompt = match req["message"].as_str().or_else(|| req["prompt"].as_str()) {
+        Some(p) => p,
+        None => {
+            let resp = response::bad_request("missing 'message' field");
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+    let system = req["system"].as_str();
+
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+    stream.flush()?;
+
+    let start_event = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type": "start", "model": llm.model(), "tenant_id": tenant.id})
+    );
+    stream.write_all(start_event.as_bytes())?;
+    stream.flush()?;
+
+    let start_time = std::time::Instant::now();
+
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(ulflow::llm::Message {
+            role: ulflow::llm::Role::System,
+            content: sys.to_string(),
+        });
+    }
+    messages.push(ulflow::llm::Message {
+        role: ulflow::llm::Role::User,
+        content: prompt.to_string(),
+    });
+    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), messages);
+
+    let mut all_chunks = Vec::<String>::new();
+    let result = llm.chat_stream(&chat_req, |chunk| {
+        all_chunks.push(chunk.to_string());
+    });
+
+    for chunk in &all_chunks {
+        let event = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "token", "content": chunk})
+        );
+        stream.write_all(event.as_bytes())?;
+        stream.flush()?;
+    }
+
+    let latency = start_time.elapsed().as_millis();
+
+    match result {
+        Ok(resp) => {
+            record_tenant_usage(
+                state,
+                tenant,
+                (resp.input_tokens + resp.output_tokens) as u64,
+            );
+            let done = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "type": "done",
+                    "tenant_id": tenant.id,
+                    "model": resp.model,
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "finish_reason": resp.finish_reason.to_string(),
+                    "latency_ms": latency,
+                })
+            );
+            stream.write_all(done.as_bytes())?;
+        }
+        Err(e) => {
+            let err = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"type": "error", "message": e.to_string()})
+            );
+            stream.write_all(err.as_bytes())?;
+        }
+    }
+    stream.flush()?;
+    Ok(())
+}
+
+pub fn handle_run_stream_for_tenant(
+    state: &AppState,
+    tenant: &Tenant,
+    body: &str,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let caps = tenant_caps(tenant);
+    if let Err(e) = caps.require_workflow_execute() {
+        let resp = response::forbidden(&e.to_string());
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = response::bad_request(&format!("invalid JSON: {}", e));
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+    stream.flush()?;
+
+    let mut flow_input = FlowInput::new();
+    if let Some(input_obj) = req["input"].as_object() {
+        for (k, v) in input_obj {
+            if let Some(s) = v.as_str() {
+                flow_input = flow_input.var(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let registry = build_tenant_registry(Arc::clone(&state.engine), tenant);
+    let flow = match Flow::pipeline("gate_run")
+        .context_budget(req["context_budget"].as_u64().unwrap_or(8192) as usize)
+        .step(
+            Step::tool("search")
+                .tool("code_search")
+                .input("query", Input::from_var("task"))
+                .build(),
+        )
+        .step(Step::agent(
+            "analyze",
+            "You are an expert software engineer.\n\nCode found:\n{{search.output}}\n\nTask: {{task}}\n\nProvide a clear, actionable response.",
+        ))
+        .build()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let err = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"type":"error","message":e.to_string()})
+            );
+            stream.write_all(err.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let start_event = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type": "start", "workflow": "gate_run", "tenant_id": tenant.id})
+    );
+    stream.write_all(start_event.as_bytes())?;
+    stream.flush()?;
+
+    let mut runner = FlowRunner::new(registry)
+        .with_capabilities(caps)
+        .with_recording();
+    if let Some(ref llm) = state.llm {
+        runner = runner.with_llm(llm.clone());
+    }
+
+    let start_time = std::time::Instant::now();
+    let result = runner.run(flow, flow_input);
+    let latency = start_time.elapsed().as_millis();
+
+    match result {
+        Ok(r) => {
+            for (key, val) in &r.outputs {
+                if let ulflow::context::ContextValue::String(s) = val {
+                    let event = format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type":"output","key":key,"content":&s[..s.len().min(2000)]})
+                    );
+                    stream.write_all(event.as_bytes())?;
+                    stream.flush()?;
+                }
+            }
+
+            let recording = runner
+                .take_recording()
+                .and_then(|rec| serde_json::to_value(rec).ok());
+
+            let mut body_json = serde_json::json!({
+                "tenant_id": tenant.id,
+                "run_id": r.run_id,
+                "status": r.status.to_string(),
+                "steps_completed": r.steps_completed,
+                "tokens_used": r.tokens_used,
+                "latency_ms": latency,
+                "outputs": r.outputs.iter().filter_map(|(k, v)| {
+                    if let ulflow::context::ContextValue::String(s) = v {
+                        Some((k.clone(), serde_json::Value::String(s.clone())))
+                    } else {
+                        None
+                    }
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+                "workflow": "default",
+                "timestamp": now_ms(),
+            });
+
+            if let Some(recording) = recording {
+                body_json["recording"] = recording;
+            }
+
+            persist_run_result_for_tenant(&state.engine, tenant, &body_json);
+            record_tenant_usage(state, tenant, r.tokens_used as u64);
+
+            let done = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "type":"done",
+                    "tenant_id": tenant.id,
+                    "status":r.status.to_string(),
+                    "steps_completed":r.steps_completed,
+                    "tokens_used":r.tokens_used,
+                    "latency_ms":latency
+                })
+            );
+            stream.write_all(done.as_bytes())?;
+        }
+        Err(e) => {
+            let err = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"type":"error","message":e.to_string()})
+            );
+            stream.write_all(err.as_bytes())?;
+        }
+    }
+    stream.flush()?;
+    Ok(())
+}
+
+pub fn handle_create_tenant(state: &AppState, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let id = match req["id"].as_str() {
+        Some(v) if !v.is_empty() => v,
+        _ => return response::bad_request("missing 'id'"),
+    };
+    let name = req["name"].as_str().unwrap_or(id);
+    let api_key = match req["api_key"].as_str() {
+        Some(v) if !v.is_empty() => v,
+        _ => return response::bad_request("missing 'api_key'"),
+    };
+
+    let mut tenant = Tenant::new(id, name, api_key);
+
+    if let Some(plan) = req["plan"].as_str() {
+        tenant = tenant.with_plan(plan);
+    }
+    if let Some(caps) = req["capabilities"].as_array() {
+        let caps: Vec<String> = caps
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !caps.is_empty() {
+            tenant = tenant.with_capabilities(caps);
+        }
+    }
+
+    {
+        let mut reg = state.tenants.write().unwrap();
+        if reg.get(id).is_some() {
+            return response::bad_request(&format!("tenant already exists: {}", id));
+        }
+        reg.register(tenant.clone());
+    }
+
+    {
+        let mut eng = state.engine.write().unwrap();
+        if let Err(e) = tenant::save_tenant(&mut eng, &tenant) {
+            return response::internal_error(&format!("persist tenant failed: {}", e));
+        }
+    }
+
+    response::created(
+        &serde_json::json!({
+            "id": tenant.id,
+            "name": tenant.name,
+            "plan": tenant.plan,
+            "namespace_id": tenant.namespace_id,
+            "capabilities": tenant.capabilities,
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_list_tenants(state: &AppState) -> String {
+    let reg = state.tenants.read().unwrap();
+    let tenants: Vec<serde_json::Value> = reg
+        .list_owned()
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "name": t.name,
+                "plan": t.plan,
+                "namespace_id": t.namespace_id,
+                "capabilities": t.capabilities,
+            })
+        })
+        .collect();
+
+    response::ok(
+        &serde_json::json!({
+            "tenants": tenants,
+            "count": tenants.len()
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_get_tenant(state: &AppState, tenant_id: &str) -> String {
+    let reg = state.tenants.read().unwrap();
+    let tenant = match reg.get(tenant_id) {
+        Some(t) => t.clone(),
+        None => return response::not_found(&format!("tenant not found: {}", tenant_id)),
+    };
+    let usage = reg.get_usage(tenant_id);
+
+    response::ok(
+        &serde_json::json!({
+            "id": tenant.id,
+            "name": tenant.name,
+            "plan": tenant.plan,
+            "namespace_id": tenant.namespace_id,
+            "capabilities": tenant.capabilities,
+            "quota": {
+                "max_tokens_per_day": tenant.quota.max_tokens_per_day,
+                "max_requests_per_hour": tenant.quota.max_requests_per_hour,
+                "max_storage_bytes": tenant.quota.max_storage_bytes,
+                "max_sessions": tenant.quota.max_sessions,
+                "max_workflows": tenant.quota.max_workflows,
+            },
+            "usage": {
+                "tokens_today": usage.tokens_today,
+                "requests_this_hour": usage.requests_this_hour,
+                "storage_bytes": usage.storage_bytes,
+                "active_sessions": usage.active_sessions,
+                "registered_workflows": usage.registered_workflows,
+                "total_runs": usage.total_runs,
+                "total_tokens": usage.total_tokens,
+            }
+        })
+        .to_string(),
+    )
+}
+
+pub fn handle_delete_tenant(state: &AppState, tenant_id: &str) -> String {
+    {
+        let mut reg = state.tenants.write().unwrap();
+        if !reg.remove(tenant_id) {
+            return response::not_found(&format!("tenant not found: {}", tenant_id));
+        }
+    }
+
+    {
+        let mut eng = state.engine.write().unwrap();
+        if let Err(e) = tenant::delete_tenant(&mut eng, tenant_id) {
+            return response::internal_error(&format!("delete tenant failed: {}", e));
+        }
+    }
+
+    response::ok(
+        &serde_json::json!({
+            "status": "deleted",
+            "tenant_id": tenant_id
+        })
+        .to_string(),
+    )
 }

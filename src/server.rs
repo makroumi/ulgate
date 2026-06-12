@@ -9,6 +9,7 @@ use crate::handlers::{self, AppState};
 use crate::ratelimit::HttpRateLimiter;
 use crate::response;
 use crate::router;
+use crate::tenant::Tenant;
 
 pub fn run(
     addr: &str,
@@ -18,16 +19,6 @@ pub fn run(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("ulgate listening on http://{}", addr);
-    println!();
-    println!("  Endpoints:");
-    println!("    GET  /v1/health");
-    println!("    GET  /v1/tools");
-    println!("    POST /v1/tools/call");
-    println!("    POST /v1/run");
-    println!("    POST /v1/chat");
-    println!("    POST /v1/db/put");
-    println!("    GET  /v1/db/get?key=...");
-    println!("    GET  /v1/db/search?q=...");
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -60,7 +51,6 @@ fn handle_connection(
     let method = parts[0];
     let path = parts[1];
 
-    // Read headers
     let mut content_length = 0usize;
     let mut headers: Vec<(String, String)> = Vec::new();
     loop {
@@ -83,7 +73,6 @@ fn handle_connection(
         }
     }
 
-    // Rate limit check
     let peer_ip = stream
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -94,28 +83,61 @@ fn handle_connection(
         return Ok(());
     }
 
-    // Auth check (skip for health and OPTIONS)
-    if auth.is_enabled()
-        && path != "/v1/health"
-        && path != "/health"
-        && path != "/"
-        && method != "OPTIONS"
-    {
-        let authorized = headers
+    let clean_path = if let Some(idx) = path.find('?') {
+        &path[..idx]
+    } else {
+        path
+    };
+
+    let skip_auth =
+        clean_path == "/v1/health" || clean_path == "/health" || clean_path == "/" || method == "OPTIONS";
+
+    let tenant_count = state.tenants.read().unwrap().count();
+    let auth_required = auth.is_enabled() || tenant_count > 0;
+
+    let mut tenant_ctx: Option<Tenant> = None;
+
+    if auth_required && !skip_auth {
+        let token = headers
             .iter()
             .find(|(k, _)| k == "authorization")
-            .and_then(|(_, v)| ApiKeyStore::extract_bearer(v))
-            .map(|token| auth.verify(token))
-            .unwrap_or(false);
+            .and_then(|(_, v)| ApiKeyStore::extract_bearer(v));
 
-        if !authorized {
-            let resp = response::http_401("invalid or missing API key");
+        let token = match token {
+            Some(t) => t,
+            None => {
+                let resp = response::http_401("missing bearer token");
+                stream.write_all(resp.as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        let admin_ok = auth.is_enabled() && auth.verify(token);
+        let tenant_match = state
+            .tenants
+            .read()
+            .unwrap()
+            .authenticate(token)
+            .cloned();
+
+        if !admin_ok && tenant_match.is_none() {
+            let resp = response::http_401("invalid API key");
             stream.write_all(resp.as_bytes())?;
             return Ok(());
         }
+
+        tenant_ctx = tenant_match;
+
+        if let Some(ref tenant) = tenant_ctx {
+            let quota = state.tenants.read().unwrap().check_quota(&tenant.id);
+            if let Err(e) = quota {
+                let resp = response::http_429(&e.to_string());
+                stream.write_all(resp.as_bytes())?;
+                return Ok(());
+            }
+        }
     }
 
-    // Read body
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         use std::io::Read;
@@ -123,68 +145,102 @@ fn handle_connection(
     }
     let body_str = String::from_utf8_lossy(&body).to_string();
 
-    eprintln!("[ulgate] {} {}", method, path);
+    eprintln!(
+        "[ulgate] {} {}{}",
+        method,
+        path,
+        tenant_ctx
+            .as_ref()
+            .map(|t| format!(" tenant={}", t.id))
+            .unwrap_or_default()
+    );
 
-    // Handle streaming endpoints directly (write to stream, not buffered response)
-    let clean_path = if let Some(idx) = path.find('?') {
-        &path[..idx]
-    } else {
-        path
-    };
     if clean_path == "/v1/chat/stream" && method == "POST" {
-        return handlers::handle_chat_stream(state, &body_str, &mut stream);
-    }
-    if clean_path == "/v1/run/stream" && method == "POST" {
-        return handlers::handle_run_stream(state, &body_str, &mut stream);
+        return match tenant_ctx.as_ref() {
+            Some(t) => handlers::handle_chat_stream_for_tenant(state, t, &body_str, &mut stream),
+            None => handlers::handle_chat_stream(state, &body_str, &mut stream),
+        };
     }
 
-    // Dynamic routes: /v1/runs/:id
+    if clean_path == "/v1/run/stream" && method == "POST" {
+        return match tenant_ctx.as_ref() {
+            Some(t) => handlers::handle_run_stream_for_tenant(state, t, &body_str, &mut stream),
+            None => handlers::handle_run_stream(state, &body_str, &mut stream),
+        };
+    }
+
     if method == "GET" && clean_path.starts_with("/v1/runs/") {
-        let run_id = &clean_path["/v1/runs/".len()..];
-        if !run_id.is_empty() {
-            let resp = handlers::handle_get_run(state, run_id);
+        let suffix = &clean_path["/v1/runs/".len()..];
+        if !suffix.is_empty() {
+            let resp = match tenant_ctx.as_ref() {
+                Some(t) => handlers::handle_get_run_for_tenant(state, t, suffix),
+                None => handlers::handle_get_run(state, suffix),
+            };
             stream.write_all(resp.as_bytes())?;
             stream.flush()?;
             return Ok(());
         }
     }
 
-    // Dynamic routes
-    let clean_path = if let Some(idx) = path.find('?') {
-        &path[..idx]
-    } else {
-        path
-    };
     if method == "POST"
         && clean_path.starts_with("/v1/sessions/")
         && clean_path.ends_with("/message")
     {
         let id = &clean_path["/v1/sessions/".len()..clean_path.len() - "/message".len()];
-        let resp = handlers::handle_session_message(state, id, &body_str);
+        let resp = match tenant_ctx.as_ref() {
+            Some(t) => handlers::handle_session_message_for_tenant(state, t, id, &body_str),
+            None => handlers::handle_session_message(state, id, &body_str),
+        };
         stream.write_all(resp.as_bytes())?;
         stream.flush()?;
         return Ok(());
     }
+
     if method == "GET" && clean_path.starts_with("/v1/sessions/") {
         let id = &clean_path["/v1/sessions/".len()..];
         if !id.is_empty() {
-            let resp = handlers::handle_get_session(state, id);
-            stream.write_all(resp.as_bytes())?;
-            stream.flush()?;
-            return Ok(());
-        }
-    }
-    if method == "POST" && clean_path.starts_with("/v1/run/") && clean_path != "/v1/run/stream" {
-        let name = &clean_path["/v1/run/".len()..];
-        if !name.is_empty() {
-            let resp = handlers::handle_run_named(state, name, &body_str);
+            let resp = match tenant_ctx.as_ref() {
+                Some(t) => handlers::handle_get_session_for_tenant(state, t, id),
+                None => handlers::handle_get_session(state, id),
+            };
             stream.write_all(resp.as_bytes())?;
             stream.flush()?;
             return Ok(());
         }
     }
 
-    let response = router::route(state, method, path, &body_str);
+    if method == "POST" && clean_path.starts_with("/v1/run/") && clean_path != "/v1/run/stream" {
+        let name = &clean_path["/v1/run/".len()..];
+        if !name.is_empty() {
+            let resp = match tenant_ctx.as_ref() {
+                Some(t) => handlers::handle_run_named_for_tenant(state, t, name, &body_str),
+                None => handlers::handle_run_named(state, name, &body_str),
+            };
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+
+    if clean_path.starts_with("/v1/tenants/") {
+        let tenant_id = &clean_path["/v1/tenants/".len()..];
+        if !tenant_id.is_empty() {
+            let resp = if tenant_ctx.is_some() {
+                response::forbidden("tenant tokens cannot manage tenants")
+            } else {
+                match method {
+                    "GET" => handlers::handle_get_tenant(state, tenant_id),
+                    "DELETE" => handlers::handle_delete_tenant(state, tenant_id),
+                    _ => response::method_not_allowed(),
+                }
+            };
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+
+    let response = router::route_with_tenant(state, method, path, &body_str, tenant_ctx.as_ref());
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 

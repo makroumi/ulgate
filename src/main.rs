@@ -1,17 +1,4 @@
 //! ulgate server binary.
-//!
-//! Usage:
-//!   ulgate [--port 8080] [--db ./data] [--llm groq:llama-3.3-70b-versatile]
-//!
-//! Environment variables:
-//!   PORT              listen port (default: 8080)
-//!   ULGATE_DB         database path (default: ./data)
-//!   LLM_PROVIDER      llm provider: groq, openai, anthropic, ollama, gemini
-//!   LLM_MODEL         model name
-//!   GROQ_API_KEY      Groq API key
-//!   OPENAI_API_KEY    OpenAI API key
-//!   ANTHROPIC_API_KEY Anthropic API key
-//!   GEMINI_API_KEY    Google Gemini API key
 
 use std::sync::{Arc, RwLock};
 use uldb::engine::{Engine, EngineConfig};
@@ -21,11 +8,11 @@ use ulgate::config::GatewayConfig;
 use ulgate::handlers::AppState;
 use ulgate::ratelimit::HttpRateLimiter;
 use ulgate::server;
+use ulgate::tenant::load_registry_from_engine;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse CLI args
     let mut port = None;
     let mut db_path = None;
     let mut llm_spec = None;
@@ -46,7 +33,7 @@ fn main() {
                 llm_spec = args.get(i).cloned();
             }
             "--api-key" | "-k" => {
-                i += 1; /* handled below via env */
+                i += 1;
             }
             "--help" | "-h" => {
                 print_help();
@@ -77,12 +64,15 @@ fn main() {
     println!("provider: {}:{}", config.llm_provider, config.llm_model);
     println!();
 
-    // Open database
     let engine = Arc::new(RwLock::new(
         Engine::open(EngineConfig::new(&config.db_path)).expect("failed to open database"),
     ));
 
-    // Build LLM
+    let tenants = {
+        let eng = engine.read().unwrap();
+        load_registry_from_engine(&eng)
+    };
+
     let llm = build_llm(&config);
     if llm.is_some() {
         println!("LLM ready: {}:{}", config.llm_provider, config.llm_model);
@@ -91,7 +81,8 @@ fn main() {
         println!("  GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY");
     }
 
-    // Build app state
+    println!("Tenants:  {} loaded", tenants.count());
+
     let registry = Arc::new(ulgate::handlers::build_default_registry(Arc::clone(
         &engine,
     )));
@@ -101,22 +92,20 @@ fn main() {
         llm,
         start_time: std::time::Instant::now(),
         version: env!("CARGO_PKG_VERSION").into(),
+        tenants: Arc::new(RwLock::new(tenants)),
     });
 
-    // Build auth (from ULGATE_API_KEY env var or --api-key)
     let auth = if let Ok(key) = std::env::var("ULGATE_API_KEY") {
-        println!("Auth:     API key required (Bearer token)");
+        println!("Auth:     admin API key required (Bearer token)");
         Arc::new(ApiKeyStore::single(&key))
     } else {
-        println!("Auth:     OPEN (set ULGATE_API_KEY to require auth)");
+        println!("Auth:     no admin key configured");
         Arc::new(ApiKeyStore::open())
     };
 
-    // Rate limiter: 100 req/sec per IP, burst of 50
     let rate_limiter = Arc::new(HttpRateLimiter::new(100, 50));
     println!("Rate:     100 req/sec per IP");
 
-    // Run server
     server::run(&config.bind_addr.to_string(), state, auth, rate_limiter).expect("server failed");
 }
 
@@ -145,28 +134,14 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  --port, -p PORT    Listen port (default: 8080)");
     println!("  --db, -d PATH      Database path (default: ./data)");
-    println!("  --llm, -l SPEC     LLM: provider:model (e.g. groq:llama-3.3-70b-versatile)");
+    println!("  --llm, -l SPEC     LLM: provider:model");
     println!("  --help, -h         Show this help");
     println!();
     println!("ENVIRONMENT:");
-    println!("  ULGATE_API_KEY     API key for ulgate auth (Bearer token)");
+    println!("  ULGATE_API_KEY     Admin API key for ulgate auth");
     println!("  GROQ_API_KEY       Groq API key");
     println!("  OPENAI_API_KEY     OpenAI API key");
     println!("  ANTHROPIC_API_KEY  Anthropic API key");
     println!("  GEMINI_API_KEY     Google Gemini API key");
     println!();
-    println!("EXAMPLES:");
-    println!("  GROQ_API_KEY=xxx ulgate --port 8080 --llm groq:llama-3.3-70b-versatile");
-    println!("  OPENAI_API_KEY=xxx ulgate --llm openai:gpt-4o");
-    println!("  ulgate --llm ollama:llama3");
-    println!();
-    println!("ENDPOINTS:");
-    println!("  GET  /v1/health           Health check");
-    println!("  GET  /v1/tools            List available tools");
-    println!("  POST /v1/tools/call       Call a tool");
-    println!("  POST /v1/run              Run an AI workflow");
-    println!("  POST /v1/chat             Chat with the LLM");
-    println!("  POST /v1/db/put           Store a document");
-    println!("  GET  /v1/db/get?key=...   Retrieve a document");
-    println!("  GET  /v1/db/search?q=...  Search documents");
 }

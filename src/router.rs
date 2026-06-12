@@ -2,9 +2,19 @@
 
 use crate::handlers::{self, AppState};
 use crate::response;
+use crate::tenant::Tenant;
 
 pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
-    // Extract query string
+    route_with_tenant(state, method, path, body, None)
+}
+
+pub fn route_with_tenant(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    body: &str,
+    tenant: Option<&Tenant>,
+) -> String {
     let (path, query) = if let Some(idx) = path.find('?') {
         (&path[..idx], &path[idx + 1..])
     } else {
@@ -12,48 +22,101 @@ pub fn route(state: &AppState, method: &str, path: &str, body: &str) -> String {
     };
 
     match (method, path) {
-        // Health
         ("GET", "/v1/health") | ("GET", "/health") | ("GET", "/") => {
             handlers::handle_health(state)
         }
-        // Tools
+
         ("GET", "/v1/tools") => handlers::handle_list_tools(state),
-        ("POST", "/v1/tools/call") => handlers::handle_tool_call(state, body),
-        // Workflow
-        ("POST", "/v1/run") => handlers::handle_run(state, body),
-        // Chat
-        ("POST", "/v1/chat") => handlers::handle_chat(state, body),
-        // Observability (ulview)
-        ("GET", "/v1/dashboard") => handlers::handle_dashboard(state),
-        ("GET", "/v1/runs") => handlers::handle_list_runs(state),
-        ("GET", "/v1/metrics") => handlers::handle_metrics(state),
-        ("GET", "/v1/logs") => handlers::handle_logs(state),
-        // Workflows
-        ("POST", "/v1/workflows") => handlers::handle_register_workflow(state, body),
-        ("GET", "/v1/workflows") => handlers::handle_list_workflows(state),
-        // Sessions
-        ("GET", "/v1/sessions") => handlers::handle_list_sessions(state),
-        // Streaming (handled separately in server.rs)
+        ("POST", "/v1/tools/call") => match tenant {
+            Some(t) => handlers::handle_tool_call_for_tenant(state, t, body),
+            None => handlers::handle_tool_call(state, body),
+        },
+
+        ("POST", "/v1/run") => match tenant {
+            Some(t) => handlers::handle_run_for_tenant(state, t, body),
+            None => handlers::handle_run(state, body),
+        },
+
+        ("POST", "/v1/chat") => match tenant {
+            Some(t) => handlers::handle_chat_for_tenant(state, t, body),
+            None => handlers::handle_chat(state, body),
+        },
+
+        ("GET", "/v1/dashboard") => match tenant {
+            Some(t) => handlers::handle_dashboard_for_tenant(state, t),
+            None => handlers::handle_dashboard(state),
+        },
+        ("GET", "/v1/runs") => match tenant {
+            Some(t) => handlers::handle_list_runs_for_tenant(state, t),
+            None => handlers::handle_list_runs(state),
+        },
+        ("GET", "/v1/metrics") => match tenant {
+            Some(t) => handlers::handle_metrics_for_tenant(state, t),
+            None => handlers::handle_metrics(state),
+        },
+        ("GET", "/v1/logs") => match tenant {
+            Some(t) => handlers::handle_logs_for_tenant(state, t),
+            None => handlers::handle_logs(state),
+        },
+
+        ("POST", "/v1/workflows") => match tenant {
+            Some(t) => handlers::handle_register_workflow_for_tenant(state, t, body),
+            None => handlers::handle_register_workflow(state, body),
+        },
+        ("GET", "/v1/workflows") => match tenant {
+            Some(t) => handlers::handle_list_workflows_for_tenant(state, t),
+            None => handlers::handle_list_workflows(state),
+        },
+
+        ("GET", "/v1/sessions") => match tenant {
+            Some(t) => handlers::handle_list_sessions_for_tenant(state, t),
+            None => handlers::handle_list_sessions(state),
+        },
+
         ("POST", "/v1/chat/stream") | ("POST", "/v1/run/stream") => {
-            // This should not be called - streaming is handled in server.rs
             response::bad_request("use streaming endpoint directly")
         }
-        // DB
-        ("POST", "/v1/db/put") => handlers::handle_put(state, body),
+
+        ("POST", "/v1/db/put") => match tenant {
+            Some(t) => handlers::handle_put_for_tenant(state, t, body),
+            None => handlers::handle_put(state, body),
+        },
         ("GET", "/v1/db/get") => {
             let key = extract_param(query, "key").unwrap_or_default();
-            handlers::handle_get(state, &key)
+            match tenant {
+                Some(t) => handlers::handle_get_for_tenant(state, t, &key),
+                None => handlers::handle_get(state, &key),
+            }
         }
         ("GET", "/v1/db/search") => {
             let q = extract_param(query, "q")
                 .or_else(|| extract_param(query, "query"))
                 .unwrap_or_default();
-            handlers::handle_search(state, &q)
+            match tenant {
+                Some(t) => handlers::handle_search_for_tenant(state, t, &q),
+                None => handlers::handle_search(state, &q),
+            }
         }
-        // CORS preflight
+
+        ("POST", "/v1/tenants") => {
+            if tenant.is_some() {
+                response::forbidden("tenant tokens cannot create tenants")
+            } else {
+                handlers::handle_create_tenant(state, body)
+            }
+        }
+        ("GET", "/v1/tenants") => {
+            if tenant.is_some() {
+                response::forbidden("tenant tokens cannot list tenants")
+            } else {
+                handlers::handle_list_tenants(state)
+            }
+        }
+
         ("OPTIONS", _) => {
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n".into()
+            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n".into()
         }
+
         _ => response::not_found(&format!("route not found: {} {}", method, path)),
     }
 }

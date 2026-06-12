@@ -376,11 +376,12 @@ pub fn handle_run_named(state: &AppState, workflow_name: &str, body: &str) -> St
     }
 
     let registry = build_default_registry(Arc::clone(&state.engine));
-    let mut runner = FlowRunner::new(registry);
+    let mut runner = FlowRunner::new(registry)
+        .with_memory(Memory::new())
+        .with_recording();
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
     }
-    // Apply capability constraints from request
     if let Some(caps_arr) = req["capabilities"].as_array() {
         let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
         let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
@@ -989,11 +990,12 @@ pub fn handle_run_stream(
     stream.write_all(start_event.as_bytes())?;
     stream.flush()?;
 
-    let mut runner = FlowRunner::new(registry);
+    let mut runner = FlowRunner::new(registry)
+        .with_memory(Memory::new())
+        .with_recording();
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
     }
-    // Apply capability constraints from request
     if let Some(caps_arr) = req["capabilities"].as_array() {
         let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
         let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
@@ -1817,6 +1819,7 @@ pub fn handle_run_for_tenant(state: &AppState, tenant: &Tenant, body: &str) -> S
 
     let mut runner = FlowRunner::new(registry)
         .with_capabilities(caps)
+        .with_memory(Memory::new())
         .with_recording();
 
     if let Some(ref llm) = state.llm {
@@ -1909,6 +1912,7 @@ pub fn handle_run_named_for_tenant(
     let registry = build_tenant_registry(Arc::clone(&state.engine), tenant);
     let mut runner = FlowRunner::new(registry)
         .with_capabilities(caps)
+        .with_memory(Memory::new())
         .with_recording();
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
@@ -2529,6 +2533,7 @@ pub fn handle_run_stream_for_tenant(
 
     let mut runner = FlowRunner::new(registry)
         .with_capabilities(caps)
+        .with_memory(Memory::new())
         .with_recording();
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());

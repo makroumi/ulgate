@@ -2203,28 +2203,31 @@ pub fn handle_get_run_for_tenant(state: &AppState, tenant: &Tenant, run_id: &str
 }
 
 pub fn handle_metrics_for_tenant(state: &AppState, tenant: &Tenant) -> String {
-    let prefix = format!("t:{}:run:", tenant.id);
+    let run_prefix = tenant.run_key("");
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+    let all_keys = uldb::agent_store::list_sessions(&eng);
 
-    let total_runs = runs.len();
+    let mut total_runs = 0u64;
     let mut total_tokens = 0u64;
     let mut total_latency = 0u64;
     let mut succeeded = 0u64;
     let mut failed = 0u64;
     let mut latencies: Vec<u64> = Vec::new();
 
-    for (_, v) in &runs {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            let tokens = json["tokens_used"].as_u64().unwrap_or(0);
-            let latency = json["latency_ms"].as_u64().unwrap_or(0);
-            total_tokens += tokens;
-            total_latency += latency;
-            latencies.push(latency);
-            if json["status"].as_str() == Some("succeeded") {
-                succeeded += 1;
-            } else {
-                failed += 1;
+    for k in all_keys.iter().filter(|k| k.starts_with(&run_prefix)) {
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            total_runs += 1;
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                total_tokens += summary.tokens;
+                total_latency += summary.latency_ms;
+                latencies.push(summary.latency_ms);
+                if summary.status == "succeeded" {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                }
             }
         }
     }
@@ -2233,16 +2236,8 @@ pub fn handle_metrics_for_tenant(state: &AppState, tenant: &Tenant) -> String {
     let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
     let p95 = latencies.get(latencies.len() * 95 / 100).copied().unwrap_or(0);
     let p99 = latencies.get(latencies.len() * 99 / 100).copied().unwrap_or(0);
-    let avg_latency = if total_runs > 0 {
-        total_latency / total_runs as u64
-    } else {
-        0
-    };
-    let avg_tokens = if total_runs > 0 {
-        total_tokens / total_runs as u64
-    } else {
-        0
-    };
+    let avg_latency = if total_runs > 0 { total_latency / total_runs } else { 0 };
+    let avg_tokens = if total_runs > 0 { total_tokens / total_runs } else { 0 };
 
     record_tenant_usage(state, tenant, 0);
 
@@ -2265,34 +2260,38 @@ pub fn handle_metrics_for_tenant(state: &AppState, tenant: &Tenant) -> String {
 }
 
 pub fn handle_dashboard_for_tenant(state: &AppState, tenant: &Tenant) -> String {
-    let runs_prefix = format!("t:{}:run:", tenant.id);
-    let sessions_prefix = format!("t:{}:session:", tenant.id);
+    let run_prefix = tenant.run_key("");
+    let session_prefix = tenant.session_key("");
     let workflows_prefix = format!("t:{}:workflow:", tenant.id);
 
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(runs_prefix.as_bytes(), &prefix_end_bytes(&runs_prefix));
-    let sessions = eng.scan(
-        sessions_prefix.as_bytes(),
-        &prefix_end_bytes(&sessions_prefix),
-    );
+    let all_keys = uldb::agent_store::list_sessions(&eng);
     let workflows = eng.scan(
         workflows_prefix.as_bytes(),
         &prefix_end_bytes(&workflows_prefix),
     );
 
-    let total_runs = runs.len();
+    let run_keys: Vec<&String> = all_keys.iter().filter(|k| k.starts_with(&run_prefix)).collect();
+    let session_count = all_keys.iter().filter(|k| k.starts_with(&session_prefix)).count();
+
+    let total_runs = run_keys.len();
     let mut total_tokens = 0u64;
     let mut recent_runs: Vec<serde_json::Value> = Vec::new();
 
-    for (_, v) in runs.iter().rev().take(10) {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            total_tokens += json["tokens_used"].as_u64().unwrap_or(0);
-            recent_runs.push(serde_json::json!({
-                "run_id": json["run_id"],
-                "status": json["status"],
-                "tokens": json["tokens_used"],
-                "latency_ms": json["latency_ms"],
-            }));
+    for k in run_keys.iter().rev().take(10) {
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                total_tokens += summary.tokens;
+                let run_id = k.strip_prefix(&run_prefix).unwrap_or(k);
+                recent_runs.push(serde_json::json!({
+                    "run_id": run_id,
+                    "status": summary.status,
+                    "tokens": summary.tokens,
+                    "latency_ms": summary.latency_ms,
+                }));
+            }
         }
     }
 
@@ -2307,7 +2306,7 @@ pub fn handle_dashboard_for_tenant(state: &AppState, tenant: &Tenant) -> String 
         "stats": {
             "total_runs": total_runs,
             "total_tokens": total_tokens,
-            "active_sessions": sessions.len(),
+            "active_sessions": session_count,
             "registered_workflows": workflows.len(),
         },
         "recent_runs": recent_runs,
@@ -2316,21 +2315,26 @@ pub fn handle_dashboard_for_tenant(state: &AppState, tenant: &Tenant) -> String 
 }
 
 pub fn handle_logs_for_tenant(state: &AppState, tenant: &Tenant) -> String {
-    let prefix = format!("t:{}:run:", tenant.id);
+    let run_prefix = tenant.run_key("");
     let eng = state.engine.read().unwrap();
-    let runs = eng.scan(prefix.as_bytes(), &prefix_end_bytes(&prefix));
+    let all_keys = uldb::agent_store::list_sessions(&eng);
 
     let mut events: Vec<serde_json::Value> = Vec::new();
-    for (_, v) in runs.iter().rev().take(50) {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-            events.push(serde_json::json!({
-                "run_id": json["run_id"],
-                "status": json["status"],
-                "workflow": json["workflow"],
-                "tokens": json["tokens_used"],
-                "latency_ms": json["latency_ms"],
-                "timestamp": json["timestamp"],
-            }));
+    for k in all_keys.iter().filter(|k| k.starts_with(&run_prefix)).rev().take(50) {
+        if let Ok(payload) = uldb::agent_store::load_payload(&eng, k) {
+            if let Some(first) = payload.records.first() {
+                let content = bridge::obs_content(first).unwrap_or("");
+                let summary = bridge::parse_run_summary(content);
+                let run_id = k.strip_prefix(&run_prefix).unwrap_or(k);
+                let workflow = bridge::obs_source(first).unwrap_or("unknown");
+                events.push(serde_json::json!({
+                    "run_id": run_id,
+                    "status": summary.status,
+                    "workflow": workflow,
+                    "tokens": summary.tokens,
+                    "latency_ms": summary.latency_ms,
+                }));
+            }
         }
     }
 

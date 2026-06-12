@@ -148,7 +148,7 @@ pub struct DegradationController {
     mode: AtomicU8,
     thresholds: DegradationThresholds,
     manual_override: AtomicU8,
-    last_check: std::sync::Mutex<Instant>,
+    #[allow(dead_code)] last_check: std::sync::Mutex<Instant>,
     shed_priority: AtomicU8,
 }
 

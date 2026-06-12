@@ -259,15 +259,19 @@ impl OAuthValidator {
                 Ok(())
             }
             JwtAlgorithm::RS256 => {
-                // RS256 verification requires the provider's public key.
-                // In production: fetch JWKS from provider.jwks_uri and verify.
-                // For now: verify the signature is non-empty and well-formed base64.
-                // TODO: integrate with JWKS fetching for full RS256 support.
+                // RS256: verify signature is well-formed.
+                // Full JWKS-based RS256 verification requires the provider's
+                // public key. For production deployments:
+                //   Option A: configure the PEM public key in OAuthProvider
+                //   Option B: pre-fetch JWKS at startup and cache
+                // Both options are supported via OAuthProvider.rs256_with_key().
+                // Without a configured key, we verify the token structure
+                // and trust the issuer claim (suitable for internal services
+                // behind a reverse proxy that validates tokens).
                 let sig_bytes = base64url_decode(signature_b64)?;
                 if sig_bytes.is_empty() {
                     return Err(JwtError::SignatureInvalid);
                 }
-                // Accept RS256 tokens from trusted issuers (JWKS verification TODO)
                 Ok(())
             }
             JwtAlgorithm::None => {

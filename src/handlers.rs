@@ -1,5 +1,6 @@
 //! HTTP request handlers.
 
+use crate::bridge;
 use crate::response;
 use crate::tenant::{self, Tenant, TenantRegistry};
 use std::sync::{Arc, RwLock};
@@ -414,6 +415,7 @@ pub fn handle_run_named(state: &AppState, workflow_name: &str, body: &str) -> St
 }
 
 /// POST /v1/sessions/:id/message - add message to session
+/// Stores chat history as ulmen AgentPayload with Msg records via agent_store.
 pub fn handle_session_message(state: &AppState, session_id: &str, body: &str) -> String {
     let req: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -425,57 +427,88 @@ pub fn handle_session_message(state: &AppState, session_id: &str, body: &str) ->
         None => return response::bad_request("missing 'message' field"),
     };
 
-    // Load or create session
-    let session_key = format!("session:{}", session_id);
-    let mut history: Vec<serde_json::Value> = {
-        let eng = state.engine.read().unwrap();
-        match eng.get(session_key.as_bytes()) {
-            Some(d) => serde_json::from_slice(&d).unwrap_or_else(|_| Vec::new()),
-            None => Vec::new(),
-        }
-    };
-
-    // Add user message
-    history.push(serde_json::json!({"role": "user", "content": message}));
-
-    // Call LLM with full history
     let llm = match &state.llm {
         Some(l) => l,
         None => return response::bad_request("no LLM configured"),
     };
 
-    let messages: Vec<ulflow::llm::Message> = history
-        .iter()
-        .filter_map(|m| {
-            let role = match m["role"].as_str()? {
-                "user" => ulflow::llm::Role::User,
+    let store_key = format!("session:{}", session_id);
+
+    // Load existing session payload (ulmen-native)
+    let existing = {
+        let eng = state.engine.read().unwrap();
+        uldb::agent_store::load_payload(&eng, &store_key).ok()
+    };
+
+    let step = existing
+        .as_ref()
+        .map(|p| p.records.len() as i64 + 1)
+        .unwrap_or(1);
+
+    // Build user Msg record
+    let user_rec = bridge::msg_record(
+        &bridge::gen_id("msg"),
+        session_id,
+        step,
+        "user",
+        message,
+        ulmen_core::count_tokens(message) as i64,
+    );
+
+    // Build LLM messages from existing ulmen records
+    let mut llm_messages: Vec<ulflow::llm::Message> = Vec::new();
+    if let Some(ref payload) = existing {
+        for rec in &payload.records {
+            if rec.record_type != ulmen_core::RecordType::Msg {
+                continue;
+            }
+            let role_str = bridge::msg_role(rec).unwrap_or("user");
+            let content = bridge::msg_content(rec).unwrap_or("");
+            let role = match role_str {
                 "assistant" => ulflow::llm::Role::Assistant,
                 "system" => ulflow::llm::Role::System,
-                _ => return None,
+                _ => ulflow::llm::Role::User,
             };
-            Some(ulflow::llm::Message {
+            llm_messages.push(ulflow::llm::Message {
                 role,
-                content: m["content"].as_str()?.to_string(),
-            })
-        })
-        .collect();
+                content: content.to_string(),
+            });
+        }
+    }
+    llm_messages.push(ulflow::llm::Message {
+        role: ulflow::llm::Role::User,
+        content: message.to_string(),
+    });
 
     let start = std::time::Instant::now();
-    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), messages);
+    let chat_req = ulflow::llm::ChatRequest::new(llm.model(), llm_messages);
 
     match llm.chat(&chat_req) {
         Ok(resp) => {
-            // Add assistant response to history
-            history.push(serde_json::json!({"role": "assistant", "content": resp.content}));
+            let assistant_rec = bridge::msg_record(
+                &bridge::gen_id("msg"),
+                session_id,
+                step + 1,
+                "assistant",
+                &resp.content,
+                (resp.input_tokens + resp.output_tokens) as i64,
+            );
 
-            // Persist to uldb
+            // Persist via agent_store (ulmen-native)
             {
                 let mut eng = state.engine.write().unwrap();
-                let _ = eng.put(
-                    session_key.as_bytes(),
-                    serde_json::to_vec(&history).unwrap().as_slice(),
+                let _ = uldb::agent_store::append_records(
+                    &mut eng,
+                    &store_key,
+                    &[user_rec, assistant_rec],
                 );
             }
+
+            let history_len = existing
+                .as_ref()
+                .map(|p| p.records.len())
+                .unwrap_or(0)
+                + 2;
 
             response::ok(
                 &serde_json::json!({
@@ -485,7 +518,7 @@ pub fn handle_session_message(state: &AppState, session_id: &str, body: &str) ->
                     "input_tokens": resp.input_tokens,
                     "output_tokens": resp.output_tokens,
                     "latency_ms": start.elapsed().as_millis() as u64,
-                    "history_length": history.len(),
+                    "history_length": history_len,
                 })
                 .to_string(),
             )
@@ -495,38 +528,38 @@ pub fn handle_session_message(state: &AppState, session_id: &str, body: &str) ->
 }
 
 /// GET /v1/sessions/:id - get session history
+/// Reads ulmen AgentPayload and converts Msg records to JSON for HTTP response.
 pub fn handle_get_session(state: &AppState, session_id: &str) -> String {
+    let store_key = format!("session:{}", session_id);
     let eng = state.engine.read().unwrap();
-    let key = format!("session:{}", session_id);
-    match eng.get(key.as_bytes()) {
-        Some(d) => {
-            let history: Vec<serde_json::Value> = serde_json::from_slice(&d).unwrap_or_default();
+    match uldb::agent_store::load_payload(&eng, &store_key) {
+        Ok(payload) => {
+            let messages = bridge::payload_to_chat_json(&payload);
             response::ok(
                 &serde_json::json!({
                     "session_id": session_id,
-                    "messages": history,
-                    "length": history.len(),
+                    "messages": messages,
+                    "length": messages.len(),
                 })
                 .to_string(),
             )
         }
-        None => response::not_found(&format!("session not found: {}", session_id)),
+        Err(_) => response::not_found(&format!("session not found: {}", session_id)),
     }
 }
 
 /// GET /v1/sessions - list all sessions
+/// Lists sessions stored as ulmen payloads via agent_store.
 pub fn handle_list_sessions(state: &AppState) -> String {
     let eng = state.engine.read().unwrap();
-    let results = eng.scan(b"session:", b"session:\xFF");
-    let sessions: Vec<serde_json::Value> = results
+    let all_keys = uldb::agent_store::list_sessions(&eng);
+    let sessions: Vec<serde_json::Value> = all_keys
         .iter()
-        .map(|(k, v)| {
-            let id = String::from_utf8_lossy(k)
-                .strip_prefix("session:")
-                .unwrap_or("?")
-                .to_string();
-            let count = serde_json::from_slice::<Vec<serde_json::Value>>(v)
-                .map(|h| h.len())
+        .filter(|k| k.starts_with("session:"))
+        .map(|k| {
+            let id = k.strip_prefix("session:").unwrap_or(k);
+            let count = uldb::agent_store::load_payload(&eng, k)
+                .map(|p| p.records.len())
                 .unwrap_or(0);
             serde_json::json!({"id": id, "messages": count})
         })
@@ -536,10 +569,52 @@ pub fn handle_list_sessions(state: &AppState) -> String {
 
 fn persist_run_result(engine: &Arc<RwLock<Engine>>, result: &serde_json::Value) {
     let run_id = result["run_id"].as_str().unwrap_or("unknown");
-    let key = format!("run:{}", run_id);
+    let store_key = format!("run:{}", run_id);
+
+    // Build ulmen payload from run result
+    let mut payload = bridge::new_payload(run_id, Some(run_id));
+
+    let status = result["status"].as_str().unwrap_or("unknown");
+    let tokens = result["tokens_used"].as_u64().unwrap_or(0);
+    let latency = result["latency_ms"].as_u64().unwrap_or(0);
+    let workflow = result["workflow"].as_str().unwrap_or("default");
+
+    // Store run metadata as an Obs record
+    payload.records.push(bridge::obs_record(
+        &bridge::gen_id("run"),
+        run_id,
+        1,
+        workflow,
+        &format!(
+            "status={} steps={} tokens={} latency={}ms",
+            status,
+            result["steps_completed"].as_u64().unwrap_or(0),
+            tokens,
+            latency,
+        ),
+        if status == "succeeded" { 1.0 } else { 0.0 },
+    ));
+
+    // Store each output as an Obs record
+    if let Some(outputs) = result["outputs"].as_object() {
+        for (i, (key, val)) in outputs.iter().enumerate() {
+            if let Some(s) = val.as_str() {
+                payload.records.push(bridge::obs_record(
+                    &bridge::gen_id("obs"),
+                    run_id,
+                    (i + 2) as i64,
+                    key,
+                    &s[..s.len().min(4000)],
+                    1.0,
+                ));
+            }
+        }
+    }
+
+    payload.header.record_count = payload.records.len();
+
     if let Ok(mut eng) = engine.write() {
-        let data = serde_json::to_vec(result).unwrap_or_default();
-        let _ = eng.put(key.as_bytes(), &data);
+        let _ = uldb::agent_store::store_payload(&mut eng, &store_key, &payload);
     }
 }
 

@@ -2533,3 +2533,162 @@ pub fn handle_delete_tenant(state: &AppState, tenant_id: &str) -> String {
         .to_string(),
     )
 }
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use uldb::engine::EngineConfig;
+
+    fn test_state() -> (AppState, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(RwLock::new(
+            Engine::open(EngineConfig::new(dir.path())).unwrap(),
+        ));
+        let registry = Arc::new(build_default_registry(Arc::clone(&engine)));
+        let state = AppState {
+            engine,
+            registry,
+            llm: None,
+            start_time: std::time::Instant::now(),
+            version: "0.1.0".into(),
+            tenants: Arc::new(RwLock::new(TenantRegistry::new())),
+        };
+        (state, dir)
+    }
+
+    #[test]
+    fn create_and_list_tenants() {
+        let (state, _dir) = test_state();
+        let resp = handle_create_tenant(
+            &state,
+            r#"{"id":"acme","name":"Acme Corp","api_key":"sk-acme-123","plan":"starter"}"#,
+        );
+        assert!(resp.contains("201"));
+        assert!(resp.contains("acme"));
+
+        let list = handle_list_tenants(&state);
+        assert!(list.contains("acme"));
+        assert!(list.contains("Acme Corp"));
+    }
+
+    #[test]
+    fn create_tenant_duplicate_rejected() {
+        let (state, _dir) = test_state();
+        handle_create_tenant(
+            &state,
+            r#"{"id":"dup","name":"D","api_key":"sk-d"}"#,
+        );
+        let resp = handle_create_tenant(
+            &state,
+            r#"{"id":"dup","name":"D2","api_key":"sk-d2"}"#,
+        );
+        assert!(resp.contains("400"));
+        assert!(resp.contains("already exists"));
+    }
+
+    #[test]
+    fn get_tenant_details() {
+        let (state, _dir) = test_state();
+        handle_create_tenant(
+            &state,
+            r#"{"id":"info","name":"Info Co","api_key":"sk-info","plan":"pro"}"#,
+        );
+        let resp = handle_get_tenant(&state, "info");
+        assert!(resp.contains("Info Co"));
+        assert!(resp.contains("pro"));
+        assert!(resp.contains("usage"));
+    }
+
+    #[test]
+    fn get_tenant_missing() {
+        let (state, _dir) = test_state();
+        let resp = handle_get_tenant(&state, "nonexistent");
+        assert!(resp.contains("404"));
+    }
+
+    #[test]
+    fn delete_tenant_works() {
+        let (state, _dir) = test_state();
+        handle_create_tenant(
+            &state,
+            r#"{"id":"gone","name":"Gone","api_key":"sk-gone"}"#,
+        );
+        let resp = handle_delete_tenant(&state, "gone");
+        assert!(resp.contains("deleted"));
+
+        let check = handle_get_tenant(&state, "gone");
+        assert!(check.contains("404"));
+    }
+
+    #[test]
+    fn tenant_scoped_put_and_get() {
+        let (state, _dir) = test_state();
+        let tenant = crate::tenant::Tenant::new("t1", "T1", "sk-t1");
+
+        let put = handle_put_for_tenant(
+            &state,
+            &tenant,
+            r#"{"key":"auth.py","value":"def validate(): pass"}"#,
+        );
+        assert!(put.contains("ok"));
+
+        let get = handle_get_for_tenant(&state, &tenant, "auth.py");
+        assert!(get.contains("validate"));
+        assert!(get.contains("t1"));
+    }
+
+    #[test]
+    fn tenant_scoped_isolation() {
+        let (state, _dir) = test_state();
+        let t1 = crate::tenant::Tenant::new("iso_a", "A", "sk-a");
+        let t2 = crate::tenant::Tenant::new("iso_b", "B", "sk-b");
+
+        handle_put_for_tenant(
+            &state,
+            &t1,
+            r#"{"key":"secret.py","value":"a_secret"}"#,
+        );
+        handle_put_for_tenant(
+            &state,
+            &t2,
+            r#"{"key":"secret.py","value":"b_secret"}"#,
+        );
+
+        let get_a = handle_get_for_tenant(&state, &t1, "secret.py");
+        assert!(get_a.contains("a_secret"));
+        assert!(!get_a.contains("b_secret"));
+
+        let get_b = handle_get_for_tenant(&state, &t2, "secret.py");
+        assert!(get_b.contains("b_secret"));
+        assert!(!get_b.contains("a_secret"));
+    }
+
+    #[test]
+    fn tenant_search_scoped() {
+        let (state, _dir) = test_state();
+        let tenant = crate::tenant::Tenant::new("srch", "S", "sk-s");
+
+        handle_put_for_tenant(
+            &state,
+            &tenant,
+            r#"{"key":"jwt.py","value":"def validate_jwt token auth"}"#,
+        );
+
+        let resp = handle_search_for_tenant(&state, &tenant, "validate jwt");
+        assert!(resp.contains("srch"));
+    }
+
+    #[test]
+    fn tenant_capability_denied() {
+        let (state, _dir) = test_state();
+        let tenant = crate::tenant::Tenant::new("limited", "L", "sk-l")
+            .with_capabilities(vec!["db:read".into()]);
+        let resp = handle_put_for_tenant(
+            &state,
+            &tenant,
+            r#"{"key":"x","value":"y"}"#,
+        );
+        assert!(resp.contains("403"));
+    }
+}

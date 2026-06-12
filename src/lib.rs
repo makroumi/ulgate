@@ -17,6 +17,8 @@
 //! Copyright (c) 2026 El Mehdi Makroumi. All rights reserved.
 
 pub mod auth;
+pub mod slo;
+pub mod oauth;
 pub mod bridge;
 pub mod config;
 pub mod handlers;

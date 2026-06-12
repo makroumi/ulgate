@@ -133,11 +133,13 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
         Err(e) => return response::internal_error(&format!("flow build failed: {}", e)),
     };
 
-    let mut runner = FlowRunner::new(registry);
+    let trace = TraceContext::new();
+    let mut runner = FlowRunner::new(registry)
+        .with_memory(Memory::new())
+        .with_recording();
     if let Some(ref llm) = state.llm {
         runner = runner.with_llm(llm.clone());
     }
-    // Apply capability constraints from request
     if let Some(caps_arr) = req["capabilities"].as_array() {
         let cap_strs: Vec<&str> = caps_arr.iter().filter_map(|v| v.as_str()).collect();
         let caps = ulflow::capability::Capabilities::from_strings("api_agent", &cap_strs);
@@ -160,7 +162,24 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
                 })
                 .collect();
 
-            let body = serde_json::json!({
+            let recording = runner
+                .take_recording()
+                .and_then(|r| serde_json::to_value(r).ok());
+
+            let cost = runner.cost_tracker().all();
+            let cost_json: serde_json::Map<String, serde_json::Value> = cost
+                .iter()
+                .map(|(model, usage)| {
+                    (model.clone(), serde_json::json!({
+                        "calls": usage.calls,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.total_tokens(),
+                    }))
+                })
+                .collect();
+
+            let mut body = serde_json::json!({
                 "run_id": result.run_id,
                 "status": result.status.to_string(),
                 "steps_completed": result.steps_completed,
@@ -169,7 +188,14 @@ pub fn handle_run(state: &AppState, body: &str) -> String {
                 "outputs": outputs,
                 "workflow": "default",
                 "timestamp": now_ms(),
+                "trace_id": trace.trace_id,
+                "cost": cost_json,
             });
+
+            if let Some(rec) = recording {
+                body["recording"] = rec;
+            }
+
             persist_run_result(&state.engine, &body);
             response::ok(&body.to_string())
         }

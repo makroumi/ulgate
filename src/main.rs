@@ -118,6 +118,7 @@ fn main() {
         audit,
         gdpr: std::sync::Arc::new(std::sync::Mutex::new(uldb::storage::gdpr::GdprManager::new())),
         oauth: std::sync::Arc::new(ulgate::oauth::OAuthValidator::new()),
+        connectors: std::sync::Arc::new(std::sync::Mutex::new(uldb::connector::ConnectorRegistry::new())),
     });
 
     let auth = if let Ok(key) = std::env::var("ULGATE_API_KEY") {

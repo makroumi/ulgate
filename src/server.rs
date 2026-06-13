@@ -177,7 +177,23 @@ fn handle_connection(
             .authenticate(token)
             .cloned();
 
-        if !admin_ok && tenant_match.is_none() {
+        // Try OAuth JWT validation if API key auth fails
+        let oauth_ok = if !admin_ok && tenant_match.is_none() && state.oauth.has_providers() {
+            match state.oauth.validate(token) {
+                Ok(claims) => {
+                    if let Ok(mut audit) = state.audit.lock() {
+                        let _ = audit.record_auth(claims.iss.as_deref(), Some(&claims.sub), true);
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        } else { false };
+
+        if !admin_ok && tenant_match.is_none() && !oauth_ok {
+            if let Ok(mut audit) = state.audit.lock() {
+                let _ = audit.record_auth(None, None, false);
+            }
             let resp = response::http_401("invalid API key");
             stream.write_all(resp.as_bytes())?;
             return Ok(());

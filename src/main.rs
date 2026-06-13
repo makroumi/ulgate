@@ -97,6 +97,12 @@ fn main() {
     probes.set_startup_complete();
     probes.set_ready();
 
+    let audit_path = std::path::Path::new(&config.db_path).join("audit.log");
+    let audit = std::sync::Arc::new(std::sync::Mutex::new(
+        uldb::storage::audit::AuditLog::open(audit_path).expect("failed to open audit log")
+    ));
+    println!("Audit:    enabled");
+
     let state = Arc::new(AppState {
         engine,
         registry,
@@ -109,6 +115,9 @@ fn main() {
         shadow,
         probes,
         shutdown: Arc::new(ulgate::probes::ShutdownController::new()),
+        audit,
+        gdpr: std::sync::Arc::new(std::sync::Mutex::new(uldb::storage::gdpr::GdprManager::new())),
+        oauth: std::sync::Arc::new(ulgate::oauth::OAuthValidator::new()),
     });
 
     let auth = if let Ok(key) = std::env::var("ULGATE_API_KEY") {

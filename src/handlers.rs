@@ -5,6 +5,10 @@ use crate::slo::SloRegistry;
 use crate::degradation::DegradationController;
 use crate::shadow::TrafficShadow;
 use crate::probes::{ProbeState, ShutdownController};
+use uldb::storage::audit::AuditLog;
+use uldb::storage::gdpr::{GdprManager, DeletionRequest, DeletionScope};
+use crate::oauth::OAuthValidator;
+use std::sync::Mutex;
 use crate::response;
 use crate::tenant::{self, Tenant, TenantRegistry};
 use std::sync::{Arc, RwLock};
@@ -27,6 +31,9 @@ pub struct AppState {
     pub shadow: Arc<TrafficShadow>,
     pub probes: Arc<ProbeState>,
     pub shutdown: Arc<ShutdownController>,
+    pub audit: Arc<Mutex<AuditLog>>,
+    pub gdpr: Arc<Mutex<GdprManager>>,
+    pub oauth: Arc<OAuthValidator>,
 }
 
 /// GET /v1/health
@@ -251,8 +258,18 @@ pub fn handle_put(state: &AppState, body: &str) -> String {
     // Per-request capability checks happen in /v1/run via capabilities field.
     let mut eng = state.engine.write().unwrap();
     match eng.put(key.as_bytes(), value.as_bytes()) {
-        Ok(()) => response::ok(&serde_json::json!({"status":"ok","key":key}).to_string()),
-        Err(e) => response::internal_error(&e.to_string()),
+        Ok(()) => {
+            if let Ok(mut audit) = state.audit.lock() {
+                let _ = audit.record_put(None, key.as_bytes(), true);
+            }
+            response::ok(&serde_json::json!({"status":"ok","key":key}).to_string())
+        }
+        Err(e) => {
+            if let Ok(mut audit) = state.audit.lock() {
+                let _ = audit.record_put(None, key.as_bytes(), false);
+            }
+            response::internal_error(&e.to_string())
+        }
     }
 }
 
@@ -1214,6 +1231,9 @@ mod tests {
             shadow: Arc::new(crate::shadow::TrafficShadow::new(1000)),
             probes: Arc::new(crate::probes::ProbeState::new()),
             shutdown: Arc::new(crate::probes::ShutdownController::new()),
+            audit: Arc::new(Mutex::new(uldb::storage::audit::AuditLog::open(dir.path().join("audit.log")).unwrap())),
+            gdpr: Arc::new(Mutex::new(GdprManager::new())),
+            oauth: Arc::new(OAuthValidator::new()),
         };
         (state, dir)
     }
@@ -2672,6 +2692,10 @@ pub fn handle_create_tenant(state: &AppState, body: &str) -> String {
         }
     }
 
+    if let Ok(mut audit) = state.audit.lock() {
+        let _ = audit.record_tenant_create(&tenant.id, &tenant.plan);
+    }
+
     response::created(
         &serde_json::json!({
             "id": tenant.id,
@@ -2760,6 +2784,10 @@ pub fn handle_delete_tenant(state: &AppState, tenant_id: &str) -> String {
         }
     }
 
+    if let Ok(mut audit) = state.audit.lock() {
+        let _ = audit.record_tenant_delete(tenant_id);
+    }
+
     response::ok(
         &serde_json::json!({
             "status": "deleted",
@@ -2767,6 +2795,164 @@ pub fn handle_delete_tenant(state: &AppState, tenant_id: &str) -> String {
         })
         .to_string(),
     )
+}
+
+
+/// GET /v1/audit -- recent audit log entries
+pub fn handle_audit(state: &AppState) -> String {
+    let audit_path = {
+        let a = state.audit.lock().unwrap();
+        a.path().to_path_buf()
+    };
+    match uldb::storage::audit::verify_and_read(&audit_path) {
+        Ok(events) => {
+            let recent: Vec<serde_json::Value> = events.iter().rev().take(100).map(|e| {
+                serde_json::json!({
+                    "sequence": e.sequence,
+                    "timestamp_ms": e.timestamp_ms,
+                    "kind": e.kind,
+                    "tenant_id": e.tenant_id,
+                    "actor": e.actor,
+                    "resource": e.resource,
+                    "outcome": e.outcome,
+                    "detail": e.detail,
+                    "chain_hash": e.chain_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                })
+            }).collect();
+            let entry_count = {
+                let a = state.audit.lock().unwrap();
+                a.entry_count()
+            };
+            let chain_hash = {
+                let a = state.audit.lock().unwrap();
+                a.chain_hash().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            };
+            response::ok(&serde_json::json!({
+                "entries": recent,
+                "count": recent.len(),
+                "total_entries": entry_count,
+                "chain_hash": chain_hash,
+                "verified": true,
+            }).to_string())
+        }
+        Err(e) => response::internal_error(&format!("audit log error: {}", e)),
+    }
+}
+
+/// POST /v1/audit/verify -- verify audit log chain integrity
+pub fn handle_audit_verify(state: &AppState) -> String {
+    let audit_path = {
+        let a = state.audit.lock().unwrap();
+        a.path().to_path_buf()
+    };
+    match uldb::storage::audit::verify_and_read(&audit_path) {
+        Ok(events) => {
+            response::ok(&serde_json::json!({
+                "verified": true,
+                "entries_checked": events.len(),
+                "chain_intact": true,
+            }).to_string())
+        }
+        Err(e) => {
+            response::ok(&serde_json::json!({
+                "verified": false,
+                "error": e.to_string(),
+                "chain_intact": false,
+            }).to_string())
+        }
+    }
+}
+
+/// POST /v1/gdpr/delete -- request data deletion
+pub fn handle_gdpr_delete(state: &AppState, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+
+    let tenant_id = match req["tenant_id"].as_str() {
+        Some(t) => t.to_string(),
+        None => return response::bad_request("missing 'tenant_id'"),
+    };
+
+    let scope_str = req["scope"].as_str().unwrap_or("tenant_all");
+    let scope = match scope_str {
+        "tenant_all" => DeletionScope::TenantAll,
+        "prefix" => {
+            let prefix = req["prefix"].as_str().unwrap_or("").to_string();
+            DeletionScope::KeyPrefix(prefix)
+        }
+        "keys" => {
+            let keys: Vec<String> = req["keys"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            DeletionScope::SpecificKeys(keys)
+        }
+        _ => return response::bad_request(&format!("unknown scope: {}", scope_str)),
+    };
+
+    let reason = req["reason"].as_str().unwrap_or("GDPR deletion request").to_string();
+    let requested_by = req["requested_by"].as_str().unwrap_or("admin").to_string();
+
+    let del_req = DeletionRequest {
+        request_id: format!("del_{}", now_ms()),
+        tenant_id: tenant_id.clone(),
+        scope,
+        reason,
+        requested_by,
+        requested_at_ms: now_ms(),
+    };
+
+    let mut eng = state.engine.write().unwrap();
+    let mut gdpr = state.gdpr.lock().unwrap();
+    match gdpr.execute_deletion(&mut eng, &del_req) {
+        Ok(result) => {
+            // Record in audit log
+            if let Ok(mut audit) = state.audit.lock() {
+                let _ = audit.record(
+                    uldb::storage::audit::AuditKind::TenantDelete,
+                    Some(&tenant_id), None,
+                    Some(&del_req.request_id),
+                    "ok",
+                    Some(&format!("keys_deleted={} bytes_freed={}", result.keys_deleted, result.bytes_freed)),
+                );
+            }
+
+            response::ok(&serde_json::json!({
+                "request_id": result.request_id,
+                "keys_deleted": result.keys_deleted,
+                "bytes_freed": result.bytes_freed,
+                "certificate": {
+                    "hash": result.certificate.hash_hex(),
+                    "verified": result.certificate.verify(),
+                    "tenant_id": result.certificate.tenant_id,
+                    "scope": result.certificate.scope,
+                    "keys_deleted": result.certificate.keys_deleted,
+                },
+            }).to_string())
+        }
+        Err(e) => response::internal_error(&format!("deletion failed: {}", e)),
+    }
+}
+
+/// GET /v1/gdpr/certificates -- list deletion certificates
+pub fn handle_gdpr_certificates(state: &AppState) -> String {
+    let gdpr = state.gdpr.lock().unwrap();
+    let certs: Vec<serde_json::Value> = gdpr.deletion_certificates().iter().map(|c| {
+        serde_json::json!({
+            "request_id": c.request_id,
+            "tenant_id": c.tenant_id,
+            "scope": c.scope,
+            "keys_deleted": c.keys_deleted,
+            "completed_at_ms": c.completed_at_ms,
+            "hash": c.hash_hex(),
+            "verified": c.verify(),
+        })
+    }).collect();
+    response::ok(&serde_json::json!({
+        "certificates": certs,
+        "count": certs.len(),
+    }).to_string())
 }
 
 #[cfg(test)]
@@ -2795,6 +2981,9 @@ mod tenant_tests {
             shadow: Arc::new(crate::shadow::TrafficShadow::new(1000)),
             probes: Arc::new(crate::probes::ProbeState::new()),
             shutdown: Arc::new(crate::probes::ShutdownController::new()),
+            audit: Arc::new(Mutex::new(uldb::storage::audit::AuditLog::open(dir.path().join("audit.log")).unwrap())),
+            gdpr: Arc::new(Mutex::new(GdprManager::new())),
+            oauth: Arc::new(OAuthValidator::new()),
         };
         (state, dir)
     }

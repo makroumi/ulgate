@@ -121,6 +121,10 @@ pub fn route_with_tenant(
         ("GET", "/v1/shadow/errors") => handlers::handle_shadow_errors(state),
         ("GET", "/v1/probes") => handlers::handle_probes(state),
         ("GET", "/v1/system") => handlers::handle_system(state),
+        ("GET", "/v1/audit") => handlers::handle_audit(state),
+        ("GET", "/v1/audit/verify") => handlers::handle_audit_verify(state),
+        ("POST", "/v1/gdpr/delete") => handlers::handle_gdpr_delete(state, body),
+        ("GET", "/v1/gdpr/certificates") => handlers::handle_gdpr_certificates(state),
 
         ("OPTIONS", _) => {
             "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n".into()

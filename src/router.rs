@@ -113,6 +113,15 @@ pub fn route_with_tenant(
             }
         }
 
+        // Enterprise endpoints
+        ("GET", "/v1/slo") => handlers::handle_slo(state),
+        ("GET", "/v1/degradation") => handlers::handle_degradation(state),
+        ("POST", "/v1/degradation") => handlers::handle_set_degradation(state, body),
+        ("GET", "/v1/shadow") => handlers::handle_shadow(state),
+        ("GET", "/v1/shadow/errors") => handlers::handle_shadow_errors(state),
+        ("GET", "/v1/probes") => handlers::handle_probes(state),
+        ("GET", "/v1/system") => handlers::handle_system(state),
+
         ("OPTIONS", _) => {
             "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n".into()
         }

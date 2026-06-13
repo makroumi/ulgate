@@ -1,6 +1,10 @@
 //! HTTP request handlers.
 
 use crate::bridge;
+use crate::slo::SloRegistry;
+use crate::degradation::DegradationController;
+use crate::shadow::TrafficShadow;
+use crate::probes::{ProbeState, ShutdownController};
 use crate::response;
 use crate::tenant::{self, Tenant, TenantRegistry};
 use std::sync::{Arc, RwLock};
@@ -18,6 +22,11 @@ pub struct AppState {
     pub start_time: std::time::Instant,
     pub version: String,
     pub tenants: Arc<RwLock<TenantRegistry>>,
+    pub slo: Arc<SloRegistry>,
+    pub degradation: Arc<DegradationController>,
+    pub shadow: Arc<TrafficShadow>,
+    pub probes: Arc<ProbeState>,
+    pub shutdown: Arc<ShutdownController>,
 }
 
 /// GET /v1/health
@@ -1191,6 +1200,8 @@ mod tests {
             Engine::open(EngineConfig::new(dir.path())).unwrap(),
         ));
         let registry = Arc::new(build_default_registry(Arc::clone(&engine)));
+        let mut slo_reg = crate::slo::SloRegistry::new();
+        slo_reg.register(crate::slo::SloTarget::new("api/run").latency_p99(5000).error_budget_pct(1.0));
         let state = AppState {
             engine,
             registry,
@@ -1198,6 +1209,11 @@ mod tests {
             start_time: std::time::Instant::now(),
             version: "0.1.0".into(),
             tenants: Arc::new(RwLock::new(TenantRegistry::new())),
+            slo: Arc::new(slo_reg),
+            degradation: Arc::new(crate::degradation::DegradationController::with_defaults()),
+            shadow: Arc::new(crate::shadow::TrafficShadow::new(1000)),
+            probes: Arc::new(crate::probes::ProbeState::new()),
+            shutdown: Arc::new(crate::probes::ShutdownController::new()),
         };
         (state, dir)
     }
@@ -2765,6 +2781,8 @@ mod tenant_tests {
             Engine::open(EngineConfig::new(dir.path())).unwrap(),
         ));
         let registry = Arc::new(build_default_registry(Arc::clone(&engine)));
+        let mut slo_reg = crate::slo::SloRegistry::new();
+        slo_reg.register(crate::slo::SloTarget::new("api/run").latency_p99(5000).error_budget_pct(1.0));
         let state = AppState {
             engine,
             registry,
@@ -2772,6 +2790,11 @@ mod tenant_tests {
             start_time: std::time::Instant::now(),
             version: "0.1.0".into(),
             tenants: Arc::new(RwLock::new(TenantRegistry::new())),
+            slo: Arc::new(slo_reg),
+            degradation: Arc::new(crate::degradation::DegradationController::with_defaults()),
+            shadow: Arc::new(crate::shadow::TrafficShadow::new(1000)),
+            probes: Arc::new(crate::probes::ProbeState::new()),
+            shutdown: Arc::new(crate::probes::ShutdownController::new()),
         };
         (state, dir)
     }
@@ -2910,4 +2933,154 @@ mod tenant_tests {
         );
         assert!(resp.contains("403"));
     }
+}
+
+// ========================================================================
+// Enterprise endpoints: SLO, Degradation, Shadow, Audit, GDPR, Cluster
+// ========================================================================
+
+/// GET /v1/slo -- SLO status for all endpoints
+pub fn handle_slo(state: &AppState) -> String {
+    let reports = state.slo.all_reports();
+    let overall = state.slo.overall_status();
+    let items: Vec<serde_json::Value> = reports.iter().map(|r| {
+        serde_json::json!({
+            "name": r.name,
+            "status": r.status.to_string(),
+            "total_requests": r.total_requests,
+            "error_count": r.error_count,
+            "error_rate_pct": format!("{:.3}", r.error_rate_pct),
+            "error_budget_remaining_pct": format!("{:.1}", r.error_budget_remaining_pct),
+            "p50_ms": r.p50_ms,
+            "p95_ms": r.p95_ms,
+            "p99_ms": r.p99_ms,
+            "latency_ok": r.latency_ok,
+            "budget_ok": r.budget_ok,
+        })
+    }).collect();
+    response::ok(&serde_json::json!({
+        "overall": overall.to_string(),
+        "endpoints": items,
+        "count": items.len(),
+    }).to_string())
+}
+
+/// GET /v1/degradation -- current degradation mode
+pub fn handle_degradation(state: &AppState) -> String {
+    let mode = state.degradation.mode();
+    response::ok(&serde_json::json!({
+        "mode": mode.to_string(),
+        "allows_writes": mode.allows_writes(),
+        "allows_llm": mode.allows_llm(),
+        "allows_reads": mode.allows_reads(),
+        "allows_workflows": mode.allows_workflows(),
+    }).to_string())
+}
+
+/// POST /v1/degradation -- set degradation mode (admin override)
+pub fn handle_set_degradation(state: &AppState, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return response::bad_request(&format!("invalid JSON: {}", e)),
+    };
+    let mode_str = match req["mode"].as_str() {
+        Some(m) => m,
+        None => return response::bad_request("missing 'mode' field"),
+    };
+    let mode = match mode_str {
+        "normal" => crate::degradation::DegradationMode::Normal,
+        "degraded" => crate::degradation::DegradationMode::Degraded,
+        "read_only" | "readonly" => crate::degradation::DegradationMode::ReadOnly,
+        "emergency" => crate::degradation::DegradationMode::Emergency,
+        "auto" => {
+            state.degradation.clear_override();
+            return response::ok(&serde_json::json!({"status": "auto mode restored"}).to_string());
+        }
+        _ => return response::bad_request(&format!("unknown mode: {}", mode_str)),
+    };
+    state.degradation.set_mode(mode);
+    response::ok(&serde_json::json!({
+        "status": "mode set",
+        "mode": mode.to_string(),
+    }).to_string())
+}
+
+/// GET /v1/shadow -- recent shadowed traffic
+pub fn handle_shadow(state: &AppState) -> String {
+    let recent = state.shadow.recent(50);
+    let items: Vec<serde_json::Value> = recent.iter().map(|r| {
+        serde_json::json!({
+            "method": r.method,
+            "path": r.path,
+            "status": r.response_status,
+            "latency_ms": r.latency_ms,
+            "tenant_id": r.tenant_id,
+            "timestamp_ms": r.timestamp_ms,
+        })
+    }).collect();
+    response::ok(&serde_json::json!({
+        "requests": items,
+        "count": items.len(),
+        "total_recorded": state.shadow.total_recorded(),
+        "buffer_size": state.shadow.buffer_size(),
+        "enabled": state.shadow.is_enabled(),
+    }).to_string())
+}
+
+/// GET /v1/shadow/errors -- only error responses
+pub fn handle_shadow_errors(state: &AppState) -> String {
+    let errors = state.shadow.filter_errors();
+    let items: Vec<serde_json::Value> = errors.iter().map(|r| {
+        serde_json::json!({
+            "method": r.method,
+            "path": r.path,
+            "status": r.response_status,
+            "latency_ms": r.latency_ms,
+            "body": &r.body[..r.body.len().min(200)],
+        })
+    }).collect();
+    response::ok(&serde_json::json!({
+        "errors": items,
+        "count": items.len(),
+    }).to_string())
+}
+
+/// GET /v1/probes -- probe status summary
+pub fn handle_probes(state: &AppState) -> String {
+    let db_ok = state.engine.read().is_ok();
+    let deg_ok = state.degradation.allows_reads();
+    response::ok(&serde_json::json!({
+        "liveness": state.probes.liveness_response().to_json(),
+        "readiness": state.probes.readiness_response(db_ok, deg_ok).to_json(),
+        "startup": state.probes.startup_response().to_json(),
+        "heartbeat_count": state.probes.heartbeat_count(),
+        "uptime_secs": state.probes.uptime_secs(),
+        "shutdown": {
+            "shutting_down": state.shutdown.is_shutting_down(),
+            "active_requests": state.shutdown.active_requests(),
+            "drained": state.shutdown.is_drained(),
+        },
+    }).to_string())
+}
+
+/// GET /v1/system -- full system info
+pub fn handle_system(state: &AppState) -> String {
+    let mode = state.degradation.mode();
+    let slo_status = state.slo.overall_status();
+    response::ok(&serde_json::json!({
+        "version": state.version,
+        "uptime_seconds": state.start_time.elapsed().as_secs(),
+        "llm": state.llm.as_ref().map(|l| format!("{}:{}", l.provider(), l.model())),
+        "tools": state.registry.tool_count(),
+        "degradation_mode": mode.to_string(),
+        "slo_status": slo_status.to_string(),
+        "shadow_enabled": state.shadow.is_enabled(),
+        "shadow_recorded": state.shadow.total_recorded(),
+        "tenants": state.tenants.read().map(|r| r.count()).unwrap_or(0),
+        "probes": {
+            "alive": state.probes.is_alive(),
+            "ready": state.probes.is_ready(),
+            "startup_complete": state.probes.is_startup_complete(),
+        },
+    }).to_string())
 }

@@ -89,6 +89,63 @@ fn handle_connection(
         path
     };
 
+    // K8s probe endpoints (always open, no auth)
+    match (method, clean_path) {
+        ("GET", "/healthz") => {
+            let resp = state.probes.liveness_response();
+            let body = resp.to_json();
+            let http = if resp.is_ok() {
+                crate::response::ok(&body)
+            } else {
+                crate::response::internal_error(&body)
+            };
+            stream.write_all(http.as_bytes())?;
+            return Ok(());
+        }
+        ("GET", "/readyz") => {
+            let db_ok = state.engine.read().is_ok();
+            let deg_ok = state.degradation.allows_reads();
+            let resp = state.probes.readiness_response(db_ok, deg_ok);
+            let body = resp.to_json();
+            let http = if resp.is_ok() {
+                crate::response::ok(&body)
+            } else {
+                crate::response::internal_error(&body)
+            };
+            stream.write_all(http.as_bytes())?;
+            return Ok(());
+        }
+        ("GET", "/startupz") => {
+            let resp = state.probes.startup_response();
+            let body = resp.to_json();
+            let http = if resp.is_ok() {
+                crate::response::ok(&body)
+            } else {
+                crate::response::internal_error(&body)
+            };
+            stream.write_all(http.as_bytes())?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Degradation: reject if in emergency mode (except health/probes)
+    if !state.degradation.allows_reads() && clean_path != "/v1/health" {
+        let resp = crate::response::internal_error("system in emergency mode");
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
+    // Shutdown: reject new requests if draining
+    if state.shutdown.should_reject_new() {
+        let resp = crate::response::internal_error("server shutting down");
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
+    state.shutdown.request_start();
+    state.probes.heartbeat();
+
     let skip_auth =
         clean_path == "/v1/health" || clean_path == "/health" || clean_path == "/" || method == "OPTIONS";
 
@@ -240,7 +297,43 @@ fn handle_connection(
         }
     }
 
+    let req_start = std::time::Instant::now();
     let response = router::route_with_tenant(state, method, path, &body_str, tenant_ctx.as_ref());
+    let latency_ms = req_start.elapsed().as_millis() as u64;
+
+    // Determine if this was an error response
+    let is_error = response.starts_with("HTTP/1.1 4") || response.starts_with("HTTP/1.1 5");
+    let status_code: u16 = if response.starts_with("HTTP/1.1 ") {
+        response[9..12].parse().unwrap_or(200)
+    } else { 200 };
+
+    // SLO tracking
+    let slo_endpoint = if clean_path.starts_with("/v1/run") { "api/run" }
+        else if clean_path.starts_with("/v1/chat") { "api/chat" }
+        else { "" };
+    if !slo_endpoint.is_empty() {
+        state.slo.record(slo_endpoint, latency_ms, is_error);
+    }
+
+    // Traffic shadow
+    state.shadow.record(
+        method, clean_path, &body_str,
+        status_code,
+        &response[response.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0)..response.len().min(4096)],
+        latency_ms,
+        tenant_ctx.as_ref().map(|t| t.id.as_str()),
+    );
+
+    // Update degradation based on SLO metrics
+    if let Some(report) = state.slo.report("api/run") {
+        state.degradation.evaluate(
+            report.error_rate_pct / 100.0,
+            report.p99_ms,
+        );
+    }
+
+    state.shutdown.request_end();
+
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 

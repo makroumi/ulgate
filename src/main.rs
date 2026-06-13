@@ -86,6 +86,17 @@ fn main() {
     let registry = Arc::new(ulgate::handlers::build_default_registry(Arc::clone(
         &engine,
     )));
+    let mut slo_reg = ulgate::slo::SloRegistry::new();
+    slo_reg.register(ulgate::slo::SloTarget::new("api/run").latency_p99(5000).error_budget_pct(1.0));
+    slo_reg.register(ulgate::slo::SloTarget::new("api/chat").latency_p99(10000).error_budget_pct(1.0));
+
+    let shadow = Arc::new(ulgate::shadow::TrafficShadow::new(10000));
+    shadow.set_enabled(true);
+
+    let probes = Arc::new(ulgate::probes::ProbeState::new());
+    probes.set_startup_complete();
+    probes.set_ready();
+
     let state = Arc::new(AppState {
         engine,
         registry,
@@ -93,6 +104,11 @@ fn main() {
         start_time: std::time::Instant::now(),
         version: env!("CARGO_PKG_VERSION").into(),
         tenants: Arc::new(RwLock::new(tenants)),
+        slo: Arc::new(slo_reg),
+        degradation: Arc::new(ulgate::degradation::DegradationController::with_defaults()),
+        shadow,
+        probes,
+        shutdown: Arc::new(ulgate::probes::ShutdownController::new()),
     });
 
     let auth = if let Ok(key) = std::env::var("ULGATE_API_KEY") {

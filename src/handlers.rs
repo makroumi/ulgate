@@ -2867,13 +2867,14 @@ pub fn handle_audit_verify(state: &AppState) -> String {
 }
 
 /// GET /v1/encryption -- encryption status
-pub fn handle_encryption(_state: &AppState) -> String {
+pub fn handle_encryption(state: &AppState) -> String {
+    let enc_enabled = state.engine.read().map(|e| e.is_encrypted()).unwrap_or(false);
     response::ok(&serde_json::json!({
         "at_rest": {
-            "enabled": false,
+            "enabled": enc_enabled,
             "algorithm": "AES-256-GCM",
             "key_derivation": "HKDF-SHA256",
-            "status": "available (enable via ULDB_ENCRYPTION_KEY env var)",
+            "status": if enc_enabled { "active" } else { "available (enable via ULDB_ENCRYPTION_KEY env var)" },
         },
         "in_transit": {
             "enabled": true,

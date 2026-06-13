@@ -64,8 +64,17 @@ fn main() {
     println!("provider: {}:{}", config.llm_provider, config.llm_model);
     println!();
 
+    let mut engine_config = EngineConfig::new(&config.db_path);
+    if let Ok(hex_key) = std::env::var("ULDB_ENCRYPTION_KEY") {
+        if let Some(key) = uldb::storage::crypto::EncKey::from_hex(&hex_key) {
+            engine_config = engine_config.with_encryption(key);
+            println!("Encrypt:  at-rest encryption ENABLED");
+        } else {
+            eprintln!("Warning: ULDB_ENCRYPTION_KEY invalid (must be 64 hex chars)");
+        }
+    }
     let engine = Arc::new(RwLock::new(
-        Engine::open(EngineConfig::new(&config.db_path)).expect("failed to open database"),
+        Engine::open(engine_config).expect("failed to open database"),
     ));
 
     let tenants = {
